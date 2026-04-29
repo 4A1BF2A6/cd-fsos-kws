@@ -127,7 +127,6 @@ def classify_embedding(embedding, labels, prototypes):
     distances = torch.cdist(embedding.unsqueeze(0), prototypes).squeeze(0)
     scores = -distances.pow(2)
     probabilities = torch.softmax(scores, dim=0)
-    best_idx = int(probabilities.argmax().item())
     ranked = sorted(
         [
             {
@@ -140,7 +139,7 @@ def classify_embedding(embedding, labels, prototypes):
         key=lambda item: item["probability"],
         reverse=True,
     )
-    return ranked[best_idx], ranked
+    return ranked[0], ranked
 
 
 def main():
