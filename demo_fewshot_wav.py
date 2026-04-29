@@ -1,5 +1,6 @@
 import argparse
 import os
+import time
 from pathlib import Path
 
 import torch
@@ -109,6 +110,50 @@ def embed_batch(model, wav_batch, device):
     return F.normalize(embeddings, p=2, dim=-1).cpu()
 
 
+def sync_device(device):
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def format_flops(flops):
+    if flops >= 1e9:
+        return f"{flops / 1e9:.3f} GFLOPs"
+    if flops >= 1e6:
+        return f"{flops / 1e6:.3f} MFLOPs"
+    if flops >= 1e3:
+        return f"{flops / 1e3:.3f} KFLOPs"
+    return f"{flops:.0f} FLOPs"
+
+
+@torch.no_grad()
+def estimate_forward_flops(model, device, seconds):
+    dummy = torch.zeros(1, 1, int(16000 * seconds), device=device)
+    activities = [torch.profiler.ProfilerActivity.CPU]
+    if device.type == "cuda":
+        activities.append(torch.profiler.ProfilerActivity.CUDA)
+
+    try:
+        _ = model.get_embeddings(dummy)
+        sync_device(device)
+        with torch.profiler.profile(activities=activities, with_flops=True) as prof:
+            _ = model.get_embeddings(dummy)
+            sync_device(device)
+        return sum(event.flops or 0 for event in prof.key_averages())
+    except Exception as exc:
+        print(f"FLOPs estimate unavailable: {exc}")
+        return None
+
+
+@torch.no_grad()
+def timed_embed_one(model, wav, device, seconds):
+    sync_device(device)
+    start = time.perf_counter()
+    embedding = embed_batch(model, wav, device).squeeze(0)
+    sync_device(device)
+    elapsed = time.perf_counter() - start
+    return embedding, elapsed, elapsed / seconds
+
+
 def build_prototypes(model, support, device):
     labels = []
     prototypes = []
@@ -157,10 +202,20 @@ def main():
     parser.add_argument("--threshold", type=float, default=None, help="Optional probability threshold.")
     parser.add_argument("--cuda", action="store_true", help="Run on CUDA.")
     parser.add_argument("--topk", type=int, default=3, help="Number of classes to print per query.")
+    parser.add_argument("--skip_flops", action="store_true", help="Skip PyTorch profiler FLOPs estimate.")
     args = parser.parse_args()
 
     device = torch.device("cuda" if args.cuda and torch.cuda.is_available() else "cpu")
     model = load_backbone(args.model_path, device)
+    if not args.skip_flops:
+        flops = estimate_forward_flops(model, device, args.seconds)
+        if flops is not None and flops > 0:
+            print(
+                f"Approx forward FLOPs per {args.seconds:.2f}s query: {format_flops(flops)} "
+                "(PyTorch profiler estimate)"
+            )
+        elif flops == 0:
+            print("Approx forward FLOPs per query: unavailable or not reported by PyTorch profiler")
     support = load_support_set(args.support_dir, args.seconds)
     labels, prototypes, counts = build_prototypes(model, support, device)
 
@@ -175,7 +230,7 @@ def main():
 
     for query_path in query_files:
         wav = read_audio(query_path, args.seconds).unsqueeze(0)
-        embedding = embed_batch(model, wav, device).squeeze(0)
+        embedding, elapsed, rtf = timed_embed_one(model, wav, device, args.seconds)
         best, ranked = classify_embedding(embedding, labels, prototypes)
         decision = best["label"]
         if args.threshold is not None and best["probability"] < args.threshold:
@@ -186,6 +241,7 @@ def main():
             f"  decision={decision} best={best['label']} "
             f"prob={best['probability']:.4f} dist={best['distance']:.4f}"
         )
+        print(f"  inference_time={elapsed * 1000:.2f} ms rtf={rtf:.4f}")
         for item in ranked[: args.topk]:
             print(f"    {item['label']}: prob={item['probability']:.4f} dist={item['distance']:.4f}")
         print()
