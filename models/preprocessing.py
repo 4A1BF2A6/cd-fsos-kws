@@ -15,6 +15,7 @@ class MFCC(AudioPrep):
         self.sample_rate = audio_prep['sample_rate']
         self.n_mfcc = audio_prep['n_mfcc']
         self.feature_bin_count = audio_prep['feature_bin_count']
+        self.force_cpu = False
 
         def next_power_of_2(x):  
             return 1 if x == 0 else 2**math.ceil(math.log2(x))
@@ -38,13 +39,24 @@ class MFCC(AudioPrep):
         super(MFCC, self).__init__()
 
     def extract_features(self, x):
-        
+        original_device = x.device
+        x_for_mfcc = x.cpu() if self.force_cpu and x.is_cuda else x
+
         with torch.no_grad():
-            features = self.mfcc(x)
+            try:
+                features = self.mfcc(x_for_mfcc)
+            except RuntimeError as exc:
+                if x.is_cuda and 'cuFFT' in str(exc):
+                    print('MFCC CUDA cuFFT failed; falling back to CPU feature extraction.')
+                    self.force_cpu = True
+                    self.mfcc.cpu()
+                    features = self.mfcc(x.cpu())
+                else:
+                    raise
         features = torch.narrow(features, -2, 0, self.feature_bin_count)
         features = features.mT # f x t -> t x f
 
-        return features
+        return features.to(original_device)
 
 
 
