@@ -40,7 +40,11 @@ class MFCC(AudioPrep):
 
     def extract_features(self, x):
         original_device = x.device
-        x_for_mfcc = x.cpu() if self.force_cpu and x.is_cuda else x
+        if self.force_cpu and x.is_cuda:
+            self.mfcc.cpu()
+            x_for_mfcc = x.cpu()
+        else:
+            x_for_mfcc = x
 
         with torch.no_grad():
             try:
