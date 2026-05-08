@@ -72,7 +72,8 @@ def test_model(data_loader, classifier, unknow_id, force_unk_testdata=False):
         else:
             y_pred_close = p_y
             y_pred_ood = None
-        y_pred_ood_tot += y_pred_ood.tolist()
+        if y_pred_ood is not None:
+            y_pred_ood_tot += y_pred_ood.tolist()
         y_pred_close_tot += y_pred_close.tolist()
 
         y_pred_tot +=  y_pred.tolist()
@@ -300,7 +301,8 @@ if __name__ == '__main__':
                 word_to_index_t[item] = j
             unk_idx_t = word_to_index_t['_unknown_'] if '_unknown_' in word_to_index_t.keys() \
                                                     else None
-            samples_t = torch.cat((samples_t[:unk_idx_t], samples_t[unk_idx_t+1:]))
+            if unk_idx_t is not None:
+                samples_t = torch.cat((samples_t[:unk_idx_t], samples_t[unk_idx_t+1:]))
             
             # shuffle samples_t's samples
             dim_size = samples_t.size(1)
