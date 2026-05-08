@@ -48,8 +48,17 @@ def compute_metrics(    y_score_pos, y_pred_pos, y_true_pos, y_pred_close_pos, y
     print(conf)
 
     '''
-        Compute Accuracy Negative Set 
+        Compute Accuracy Negative Set
     '''
+    if y_score_neg is None:
+        # Closed-set evaluation (no negative set): return positive-set metrics only,
+        # with zeros for the open-set fields so log.fields keys remain populated.
+        return {'aucROC': 0.0, 'n_pos': n_pos, 'n_neg': 0,
+                'accuracy_pos': accuracy_pos,
+                'accuracy_neg': 0.0,
+                'acc_prec95': 0.0, 'thr_prec95': 0.0,
+                'frr_prec95': 0.0, 'cerr_prec95': 0.0}
+
     n_neg = len(y_score_neg)
     accuracy_neg, mean_score_ok, mean_score_wrong, conf = \
         stas_datasets(n_neg, y_pred_neg, y_true_neg, y_score_neg)
