@@ -185,10 +185,24 @@ if __name__ == '__main__':
         opt['model.num_classes'] = num_classes
         print("The task {} of the {} Dataset has {} classes".format(
                 pos_task, dataset, num_classes))
-        
+
         ds_neg = None
         if neg_task is not None:
-            ds_neg = UASpeechDataset(data_dir, neg_task, 
+            ds_neg = UASpeechDataset(data_dir, neg_task,
+                    opt['data.cuda'], speech_args)
+            print("The task {} is used for negative samples".format(
+                    neg_task))
+    elif dataset == 'CompanyKWS':
+        from data.CompanyKWS import CompanyKWSDataset
+        ds = CompanyKWSDataset(data_dir, pos_task, opt['data.cuda'], speech_args)
+        num_classes = ds.num_classes()
+        opt['model.num_classes'] = num_classes
+        print("The task {} of the {} Dataset has {} classes".format(
+                pos_task, dataset, num_classes))
+
+        ds_neg = None
+        if neg_task is not None:
+            ds_neg = CompanyKWSDataset(data_dir, neg_task,
                     opt['data.cuda'], speech_args)
             print("The task {} is used for negative samples".format(
                     neg_task))

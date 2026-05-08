@@ -34,8 +34,11 @@ if __name__ == '__main__':
     opt = vars(parser.parse_args())
     opt['model.x_dim'] = list(map(int, opt['model.x_dim'].split(',')))
     opt['log.fields'] = ['loss']
-    opt['speech.dataset'] = 'MSWC'
-    opt['speech.task'] = 'MSWC500U'
+    # Allow overriding the source-domain dataset via CLI; only fall back to MSWC
+    # when the user did not pass --speech.dataset (i.e. left the parser default).
+    if opt['speech.dataset'] in (None, '', 'googlespeechcommand'):
+        opt['speech.dataset'] = 'MSWC'
+        opt['speech.task'] = 'MSWC500U'
     opt['model.model_name'] = 'repr_conv'
     opt['model.encoding'] = 'DSCNNL_LAYERNORM'
     opt['train.loss'] = 'triplet'
@@ -115,6 +118,9 @@ if __name__ == '__main__':
     elif dataset == 'MSWC':
         from data.MSWC import MSWCDataset
         ds_tr = MSWCDataset(data_dir, train_task, False, speech_args)
+    elif dataset == 'CompanyKWS':
+        from data.CompanyKWS import CompanyKWSDataset
+        ds_tr = CompanyKWSDataset(data_dir, train_task, opt['data.cuda'], speech_args)
     else:
         raise ValueError("Dataset not recognized")
 

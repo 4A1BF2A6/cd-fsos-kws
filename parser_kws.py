@@ -96,6 +96,8 @@ parser.add_argument('--speech.bg_volume', type=float, default=0.1, help='backgro
 parser.add_argument('--speech.bg_frequency', type=float, default=1.0, help='Amount of samples that should be mixed with background noise (between 0 and 1)')
 parser.add_argument('--speech.num_silence', type=int, default=1000, help='Number of silence samples to generate')
 parser.add_argument('--speech.foreground_volume', type=float, default=1)
+parser.add_argument('--speech.channel', type=str, default='ch07',
+                    help='which channel wav to load for CompanyKWS, e.g. ch01/ch07 (default: ch07)')
 
 parser.add_argument('--speech.include_noise', action='store_true', default=True, help="one of the classes out of n should be unknown (default: False)")
 parser.add_argument('--speech.noise_snr', type=int, default=5, help='time shift the audio in milliseconds')
