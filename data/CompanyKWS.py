@@ -308,10 +308,12 @@ class CompanyKWSDataset:
             sound = sound.mean(dim=0, keepdim=True)
         if sr != self.sample_rate:
             sound = AF.resample(sound, sr, self.sample_rate)
-        # cap to a window slightly longer than desired_samples; shift_and_pad will trim/pad.
+        # Center-crop to a window slightly longer than desired_samples; shift_and_pad will trim/pad.
+        # Center crop avoids dropping the discriminative tail of phrases like "Hey Reco" / "Hey Camy".
         max_len = self.desired_samples + int(self.time_shift_ms * self.sample_rate / 1000)
         if sound.size(1) > max_len:
-            sound = sound[:, :max_len]
+            start = (sound.size(1) - max_len) // 2
+            sound = sound[:, start:start + max_len]
         if d[key_label] == SILENCE_LABEL:
             sound = torch.zeros(1, self.desired_samples)
         d[out_field] = sound
