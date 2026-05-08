@@ -51,6 +51,8 @@ class conv_cka(nn.Module):
 
     def forward(self, x):
         y = self.conv(x)
+        if self.ad_type == 'none':
+            return y
         if self.delta.device != x.device:
             self.delta = nn.Parameter(self.delta.to(x.device))
         if self.ad_type == 'residual':
