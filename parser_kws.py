@@ -98,6 +98,11 @@ parser.add_argument('--speech.num_silence', type=int, default=1000, help='Number
 parser.add_argument('--speech.foreground_volume', type=float, default=1)
 parser.add_argument('--speech.channel', type=str, default='ch07',
                     help='which channel wav to load for CompanyKWS, e.g. ch01/ch07 (default: ch07)')
+parser.add_argument('--speech.crop_strategy', type=str, default='center',
+                    choices=['center', 'energy'],
+                    help='how to crop variable-length audio to clip_duration: '
+                         'center (geometric middle) or energy (1s window with max RMS energy). '
+                         'Only used by CompanyKWS wrapper. Default: center')
 
 parser.add_argument('--speech.include_noise', action='store_true', default=True, help="one of the classes out of n should be unknown (default: False)")
 parser.add_argument('--speech.noise_snr', type=int, default=5, help='time shift the audio in milliseconds')

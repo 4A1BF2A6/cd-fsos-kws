@@ -87,6 +87,9 @@ class CompanyKWSDataset:
         self.unknown = args['include_unknown']
 
         self.channel = args.get('channel', 'ch07')
+        self.crop_strategy = args.get('crop_strategy', 'center')
+        if self.crop_strategy not in ('center', 'energy'):
+            raise ValueError("crop_strategy must be 'center' or 'energy', got {}".format(self.crop_strategy))
         self.data_cache = {}
         self.data_dir = data_dir
 
@@ -308,16 +311,33 @@ class CompanyKWSDataset:
             sound = sound.mean(dim=0, keepdim=True)
         if sr != self.sample_rate:
             sound = AF.resample(sound, sr, self.sample_rate)
-        # Center-crop to a window slightly longer than desired_samples; shift_and_pad will trim/pad.
-        # Center crop avoids dropping the discriminative tail of phrases like "Hey Reco" / "Hey Camy".
+        # Crop to a window slightly longer than desired_samples; shift_and_pad will trim/pad.
         max_len = self.desired_samples + int(self.time_shift_ms * self.sample_rate / 1000)
         if sound.size(1) > max_len:
-            start = (sound.size(1) - max_len) // 2
+            start = self._pick_crop_start(sound, max_len)
             sound = sound[:, start:start + max_len]
         if d[key_label] == SILENCE_LABEL:
             sound = torch.zeros(1, self.desired_samples)
         d[out_field] = sound
         return d
+
+    def _pick_crop_start(self, sound, max_len):
+        if self.crop_strategy == 'center':
+            return (sound.size(1) - max_len) // 2
+        # 'energy': pick the max-RMS window of size max_len.
+        # Use a coarse hop (~10ms) for speed; we only need rough peak localization.
+        hop = max(1, int(0.01 * self.sample_rate))
+        sq = sound.pow(2).sum(dim=0)  # (T,)
+        # Cumulative sum trick for O(T) windowed energy.
+        csum = torch.cat([torch.zeros(1, dtype=sq.dtype), sq.cumsum(0)])
+        T = sq.size(0)
+        n_starts = (T - max_len) // hop + 1
+        if n_starts <= 1:
+            return 0
+        starts = torch.arange(n_starts) * hop
+        win_energy = csum[starts + max_len] - csum[starts]
+        best = int(starts[win_energy.argmax()].item())
+        return best
 
     def load_background_data(self):
         background_data = []
