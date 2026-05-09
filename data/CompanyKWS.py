@@ -312,10 +312,13 @@ class CompanyKWSDataset:
         return d
 
     def load_audio(self, key_path, key_label, out_field, d):
+        # Shallow-copy so we don't permanently mutate the underlying record dict
+        # (torchnet's ListDataset returns the same instance on each access).
+        d = dict(d)
         target_len = self.desired_samples + int(self.time_shift_ms * self.sample_rate / 1000)
 
         # Background slice path: read a fixed offset chunk; bypass crop_strategy.
-        bg_offset_s = d.get('bg_offset_seconds', None)
+        bg_offset_s = d.pop('bg_offset_seconds', None)
         if bg_offset_s is not None:
             info = torchaudio.info(d[key_path])
             src_sr = info.sample_rate
