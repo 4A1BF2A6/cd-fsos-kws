@@ -56,8 +56,8 @@ def compute_metrics(    y_score_pos, y_pred_pos, y_true_pos, y_pred_close_pos, y
         return {'aucROC': 0.0, 'n_pos': n_pos, 'n_neg': 0,
                 'accuracy_pos': accuracy_pos,
                 'accuracy_neg': 0.0,
-                'acc_prec95': 0.0, 'thr_prec95': 0.0,
-                'frr_prec95': 0.0, 'cerr_prec95': 0.0}
+                'acc_far05': 0.0, 'thr_far05': 0.0,
+                'frr_far05': 0.0, 'cerr_far05': 0.0}
 
     n_neg = len(y_score_neg)
     accuracy_neg, mean_score_ok, mean_score_wrong, conf = \
@@ -121,6 +121,6 @@ def compute_metrics(    y_score_pos, y_pred_pos, y_true_pos, y_pred_close_pos, y
     return {'aucROC':auroc, 'n_pos':n_pos, 'n_neg':n_neg, 
             'accuracy_pos': accuracy_pos, 
             'accuracy_neg': accuracy_neg,
-            'acc_prec95': acc_xxfar, 'thr_prec95': thr_xxfar, 
-            'frr_prec95': frr_xxfar,'cerr_prec95': cerr_xxfar }
+            'acc_far05': acc_xxfar, 'thr_far05': thr_xxfar,
+            'frr_far05': frr_xxfar,'cerr_far05': cerr_xxfar }
 

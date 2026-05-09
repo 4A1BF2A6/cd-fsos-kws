@@ -229,7 +229,7 @@ if __name__ == '__main__':
     # Postprocess arguments
     #   list of log variables. may be turned into a configurable list usign opt['log.fields'] as 
     #   opt['log.fields'] = opt['log.fields'].split(',')
-    opt['log.fields'] = ['aucROC','accuracy_pos', 'accuracy_neg', 'acc_prec95','frr_prec95']
+    opt['log.fields'] = ['aucROC','accuracy_pos', 'accuracy_neg', 'acc_far05','frr_far05']
 
     # import stats
     meters = { field: tnt.meter.AverageValueMeter() for field in opt['log.fields'] } 
