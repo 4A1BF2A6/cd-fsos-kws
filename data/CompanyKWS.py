@@ -90,6 +90,9 @@ class CompanyKWSDataset:
         self.crop_strategy = args.get('crop_strategy', 'center')
         if self.crop_strategy not in ('center', 'energy'):
             raise ValueError("crop_strategy must be 'center' or 'energy', got {}".format(self.crop_strategy))
+        self.merge_val = args.get('merge_val', 'none')
+        if self.merge_val not in ('none', 'train', 'test'):
+            raise ValueError("merge_val must be 'none', 'train' or 'test', got {}".format(self.merge_val))
         self.data_cache = {}
         self.data_dir = data_dir
 
@@ -417,6 +420,14 @@ class CompanyKWSDataset:
                         'speaker': 'None',
                     })
 
+        # optionally absorb validation into another split (default: keep standalone)
+        if self.merge_val == 'train' and self.data_set['validation']:
+            self.data_set['training'].extend(self.data_set['validation'])
+            self.data_set['validation'] = []
+        elif self.merge_val == 'test' and self.data_set['validation']:
+            self.data_set['testing'].extend(self.data_set['validation'])
+            self.data_set['validation'] = []
+
         # deterministic shuffle
         for split in ['validation', 'testing', 'training']:
             random.Random(RANDOM_SEED).shuffle(self.data_set[split])
@@ -430,9 +441,10 @@ class CompanyKWSDataset:
             self.word_to_index[UNKNOWN_WORD_LABEL] = UNKNOWN_WORD_INDEX
 
         # surface split sizes for visibility
-        print('[CompanyKWS] channel={} | wakes={} | speakers train/val/test = {}/{}/{} | '
+        print('[CompanyKWS] channel={} | crop={} | merge_val={} | wakes={} | '
+              'speakers train/val/test = {}/{}/{} | '
               'samples train/val/test = {}/{}/{}'.format(
-                  self.channel,
+                  self.channel, self.crop_strategy, self.merge_val,
                   len(training_parameters['wanted_words']),
                   len(train_set), len(val_set), len(test_set),
                   len(self.data_set['training']),

@@ -103,6 +103,11 @@ parser.add_argument('--speech.crop_strategy', type=str, default='center',
                     help='how to crop variable-length audio to clip_duration: '
                          'center (geometric middle) or energy (1s window with max RMS energy). '
                          'Only used by CompanyKWS wrapper. Default: center')
+parser.add_argument('--speech.merge_val', type=str, default='none',
+                    choices=['none', 'train', 'test'],
+                    help='how to absorb the validation split when it is otherwise unused: '
+                         'none keeps it standalone; train merges into training; '
+                         'test merges into testing. Only used by CompanyKWS wrapper. Default: none')
 
 parser.add_argument('--speech.include_noise', action='store_true', default=True, help="one of the classes out of n should be unknown (default: False)")
 parser.add_argument('--speech.noise_snr', type=int, default=5, help='time shift the audio in milliseconds')
