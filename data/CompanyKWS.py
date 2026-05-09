@@ -251,6 +251,9 @@ class CompanyKWSDataset:
         return d
 
     def mix_background(self, use_background, k, key_label, d):
+        # _unknown_ samples ARE background slices already; don't mix more noise into them.
+        if d[key_label] == UNKNOWN_WORD_LABEL:
+            return d
         foreground = d[k]
         has_bg = len(self.background_data) > 0
         if has_bg and (use_background or d[key_label] == SILENCE_LABEL):
@@ -309,16 +312,38 @@ class CompanyKWSDataset:
         return d
 
     def load_audio(self, key_path, key_label, out_field, d):
+        target_len = self.desired_samples + int(self.time_shift_ms * self.sample_rate / 1000)
+
+        # Background slice path: read a fixed offset chunk; bypass crop_strategy.
+        bg_offset_s = d.get('bg_offset_seconds', None)
+        if bg_offset_s is not None:
+            info = torchaudio.info(d[key_path])
+            src_sr = info.sample_rate
+            src_offset = int(bg_offset_s * src_sr)
+            # Read a slightly larger window in source rate so resample lands on >= target_len.
+            src_n_frames = int((target_len / self.sample_rate + 0.05) * src_sr)
+            sound, sr = torchaudio.load(d[key_path], normalize=True,
+                                        frame_offset=src_offset, num_frames=src_n_frames)
+            if sound.size(0) > 1:
+                sound = sound.mean(dim=0, keepdim=True)
+            if sr != self.sample_rate:
+                sound = AF.resample(sound, sr, self.sample_rate)
+            if sound.size(1) > target_len:
+                sound = sound[:, :target_len]
+            elif sound.size(1) < target_len:
+                sound = F.pad(sound, (0, target_len - sound.size(1)))
+            d[out_field] = sound
+            return d
+
         sound, sr = torchaudio.load(d[key_path], normalize=True)
         if sound.size(0) > 1:
             sound = sound.mean(dim=0, keepdim=True)
         if sr != self.sample_rate:
             sound = AF.resample(sound, sr, self.sample_rate)
         # Crop to a window slightly longer than desired_samples; shift_and_pad will trim/pad.
-        max_len = self.desired_samples + int(self.time_shift_ms * self.sample_rate / 1000)
-        if sound.size(1) > max_len:
-            start = self._pick_crop_start(sound, max_len)
-            sound = sound[:, start:start + max_len]
+        if sound.size(1) > target_len:
+            start = self._pick_crop_start(sound, target_len)
+            sound = sound[:, start:start + target_len]
         if d[key_label] == SILENCE_LABEL:
             sound = torch.zeros(1, self.desired_samples)
         d[out_field] = sound
@@ -405,6 +430,43 @@ class CompanyKWSDataset:
             else:
                 self.data_set['training'].append(entry)
 
+        # _unknown_ samples sliced from background wavs (open-set rejection class)
+        if self.unknown:
+            bg_pattern = os.path.join(self.data_dir, '*', '*' + BACKGROUND_DIR_SUFFIX, '*.wav')
+            bg_meta = []
+            min_dur = self.clip_duration_ms / 1000.0 + 0.2
+            for f in sorted(glob.glob(bg_pattern)):
+                try:
+                    info = torchaudio.info(f)
+                    dur = info.num_frames / info.sample_rate
+                    if dur >= min_dur:
+                        bg_meta.append((f, dur))
+                except Exception as exc:
+                    print('[CompanyKWS] skip background {} ({})'.format(f, exc))
+            if not bg_meta:
+                print('[CompanyKWS] WARNING: include_unknown=True but no usable '
+                      '*_background/*.wav found; _unknown_ class will be empty.')
+            else:
+                rng_unk = random.Random(RANDOM_SEED + 7)
+                n_wakes = max(1, len(training_parameters['wanted_words']))
+                for split in ['training', 'validation', 'testing']:
+                    set_size = len(self.data_set[split])
+                    if set_size == 0:
+                        continue
+                    # Aim for one unknown sample per per-class average — keeps the
+                    # _unknown_ class balanced against each wake-word class.
+                    unk_count = int(math.ceil(set_size / n_wakes))
+                    for _ in range(unk_count):
+                        f, dur = rng_unk.choice(bg_meta)
+                        max_offset = max(0.0, dur - self.clip_duration_ms / 1000.0 - 0.1)
+                        bg_offset = rng_unk.uniform(0.0, max_offset) if max_offset > 0 else 0.0
+                        self.data_set[split].append({
+                            'label': UNKNOWN_WORD_LABEL,
+                            'file': f,
+                            'speaker': 'background',
+                            'bg_offset_seconds': bg_offset,
+                        })
+
         # silence samples
         if self.silence and len(self.data_set['training']) > 0:
             silence_wav_path = self.data_set['training'][0]['file']
@@ -441,12 +503,16 @@ class CompanyKWSDataset:
             self.word_to_index[UNKNOWN_WORD_LABEL] = UNKNOWN_WORD_INDEX
 
         # surface split sizes for visibility
-        print('[CompanyKWS] channel={} | crop={} | merge_val={} | wakes={} | '
+        def _count_unk(split):
+            return sum(1 for r in self.data_set[split] if r['label'] == UNKNOWN_WORD_LABEL)
+        print('[CompanyKWS] channel={} | crop={} | merge_val={} | unknown={} | wakes={} | '
               'speakers train/val/test = {}/{}/{} | '
-              'samples train/val/test = {}/{}/{}'.format(
-                  self.channel, self.crop_strategy, self.merge_val,
+              'samples train/val/test = {}/{}/{} | '
+              '_unknown_ in train/val/test = {}/{}/{}'.format(
+                  self.channel, self.crop_strategy, self.merge_val, self.unknown,
                   len(training_parameters['wanted_words']),
                   len(train_set), len(val_set), len(test_set),
                   len(self.data_set['training']),
                   len(self.data_set['validation']),
-                  len(self.data_set['testing'])))
+                  len(self.data_set['testing']),
+                  _count_unk('training'), _count_unk('validation'), _count_unk('testing')))

@@ -370,10 +370,15 @@ if __name__ == '__main__':
             class_list = [x for x in class_list if 'unknown' not in x])
         y_score_pos, y_pred_pos, y_true_pos, y_pred_close_pos, y_pred_ood_pos = test_model(query_loader, classifier, unk_idx)
 
-        # test on the negative dataset (_unknown_) if present    
+        # test on the negative dataset (_unknown_) if present
         if ds_neg is not None:
             neg_loader = ds_neg.get_iid_dataloader('testing', opt['fsl.test.batch_size'])
             y_score_neg, y_pred_neg, y_true_neg, y_pred_close_neg, y_pred_ood_neg = test_model(neg_loader, classifier, unk_idx, force_unk_testdata=True)
+        elif '_unknown_' in classifier.word_to_index:
+            # Open-set eval against this dataset's own _unknown_ samples (no separate ds_neg).
+            neg_loader = ds.get_iid_dataloader('testing', opt['fsl.test.batch_size'],
+                                               class_list=['_unknown_'])
+            y_score_neg, y_pred_neg, y_true_neg, y_pred_close_neg, y_pred_ood_neg = test_model(neg_loader, classifier, unk_idx, force_unk_testdata=False)
         else:
             y_score_neg, y_pred_neg, y_true_neg, y_pred_close_neg, y_pred_ood_neg = None, None, None, None, None
         
