@@ -31,9 +31,20 @@ python target_adapting_querying.py --data.cuda --choose_cuda 0 \
   --fsl.test.n_episodes 100 \
   --querying.prototype_reprojection
 ```
-`speech.dataset` 取值 {`googlespeechcommand`, `UASpeech`, `MDSC`}，需要和对应的 `speech.task`（`GSC12,GSC22` / `UASpeech12,UASpeech22` / `MDSC12,MDSC22`）以及 `speech.default_datadir` 配套使用。测试结果默认写到 `model.model_path` 同级目录。
+`speech.dataset` 取值 {`googlespeechcommand`, `UASpeech`, `MDSC`, `CompanyKWS`}，需要和对应的 `speech.task`（`GSC12,GSC22` / `UASpeech12,UASpeech22` / `MDSC12,MDSC22` / `CompanyKWS_ALL` 或自定义 wake word 标签）以及 `speech.default_datadir` 配套使用。测试结果默认写到 `model.model_path` 同级目录。
 
-仓库里**没有**自动化测试、lint 配置或构建步骤——入口就是上面两个脚本（`train_class_loss.py` 是较少使用的第三个训练变体）。
+`CompanyKWS` 特有参数：`--speech.channel`（默认 `ch07`，DSP 增强通道）、`--speech.crop_strategy`（`center`/`energy`，变长音频裁切策略）、`--speech.merge_val`（`none`/`train`/`test`，验证集并入方式）。其数据目录布局为 `<data_dir>/<wake>/<emp_id>/<env>_<dist>_<speed>_<take>/ch0X.wav`，背景音放在 `<data_dir>/<wake>/<env>_background/*.wav`，train/test 按 `emp_id` 说话人不重叠划分。
+
+实时少样本推理演示（给定 support 集目录和查询音频文件）：
+```
+python demo_fewshot_wav.py \
+  --model results/Pretrain_DSCNN_MSWC/best_model.pt \
+  --support <support_dir>/   \   # 子目录名即类别标签，每个子目录放若干 wav/flac/ogg
+  --query <audio_file_or_dir>
+```
+`demo_fewshot_wav.py` 不依赖 `parser_kws.py`，自带 `argparse`，可独立运行，无需配数据集。
+
+仓库里**没有**自动化测试、lint 配置或构建步骤——入口就是上面三个脚本（`train_class_loss.py` 是较少使用的第三个训练变体）。
 
 ## 参数约定
 
@@ -52,8 +63,9 @@ python target_adapting_querying.py --data.cuda --choose_cuda 0 \
   - `models/preprocessing.py`——MFCC 前端。当 `data.cuda` 为 True 时，`model.preprocessing.mfcc` 需要单独 `.cuda()`，不会随 `model.cuda()` 一起搬。
   - `models/CKAs_module.py` + `models/adapting_para_selection.py`——Custom Keyword Adapter 包装层。`--adapting.cka-ad-type`、`--adapting.cka-ad-form`、`--adapting.cka-opt`、`--adapting.cka-init` 控制 adapter 的形状、初始化方式以及哪些参数参与训练。
 - `classifiers/`——可替换的少样本分类器（`NearestClassMean`、`NCMOpenMax`、`PeelerClass`、`DProto`、`prototype_reprojection`）。统一接口为 `evaluate_batch(x, labels, return_probas=...)`，并都暴露 `word_to_index`；`_unknown_` 是开集 / OOD 类。
-- `data/`——每个数据集一个 wrapper：`MSWC.py`（源域），`GSC.py`、`UASpeech.py`、`MDSC.py`（目标域），加上 `data_utils.py`。每个 wrapper 暴露 episodic dataloader（如 `ds.get_episodic_dataloader(split, n_way, n_support+n_query, n_episodes)`），返回 `{'data', 'label'}` 批次。**注意**：`source_pretraining.py` 里 import 的是 `data.GSCSpeechData.GSCSpeechDataset` 和 `data.MSWC.MSWCDataset`，如果某个 import 路径和实际文件名对不上，那是仓库本身的遗留问题，不要随手重命名。
-- `results/Pretrain_DSCNN_MSWC/`——已附带的预训练 checkpoint（`best_model.pt`）+ `opt.json`（训练起始时保存的完整参数快照）+ `trace.txt`（`log.py` 写的逐 epoch JSON-lines 日志）。
+- `data/`——每个数据集一个 wrapper：`MSWC.py`（源域），`GSC.py`、`UASpeech.py`、`MDSC.py`、`CompanyKWS.py`（目标域），加上 `data_utils.py`。每个 wrapper 暴露 episodic dataloader（如 `ds.get_episodic_dataloader(split, n_way, n_support+n_query, n_episodes)`），返回 `{'data', 'label'}` 批次。**注意**：`source_pretraining.py` 里 import 的是 `data.GSCSpeechData.GSCSpeechDataset` 和 `data.MSWC.MSWCDataset`，如果某个 import 路径和实际文件名对不上，那是仓库本身的遗留问题，不要随手重命名。
+- `results/Pretrain_DSCNN_MSWC/`——已附带的预训练 checkpoint（`best_model.pt`）+ `opt.json`（训练起始时保存的完整参数快照）+ `trace.txt`（`log.py` 写的逐 epoch JSON-lines 日志）。自适应结果写到同目录下 `Adapting_results_<suffix>/`，suffix 由 episode 数、是否 PRM、分类器类型、数据集、n\_way、n\_support、n\_episodes 拼成。
+- `demo_fewshot_wav.py`——独立推理脚本（不依赖 `parser_kws.py`）。加载 encoder checkpoint，从 support 目录（子目录名=类别）构建原型，对查询音频做 nearest-prototype 分类，并打印每类概率及 latency / FLOPs 估算。支持 `.wav/.flac/.ogg/.opus/.mp3`。
 
 ## 数据目录布局
 
