@@ -94,7 +94,7 @@ class FeatureWiseTransformation2d_fw(nn.BatchNorm2d):
     return out
 
 class DSCNN(nn.Module):
-    
+
     def __init__(self, t_dim, f_dim, model_size_info, padding_0, last_norm=True, return_feat_maps=False ):
         super(DSCNN, self).__init__()
         self.input_features = [t_dim,f_dim]
@@ -118,10 +118,10 @@ class DSCNN(nn.Module):
             i += 1
             conv_sf[layer_no] = model_size_info[i]
             i += 1
-            
-            
+
+
         ds_cnn_layers = []
-        
+
         for layer_no in range(0,num_layers):
             num_filters = conv_feat[layer_no]
             kernel_size = (conv_kt[layer_no],conv_kf[layer_no])
@@ -146,24 +146,59 @@ class DSCNN(nn.Module):
                     # ds_cnn_layers.append( AN(num_filters) )
                     ds_cnn_layers.append( nn.ReLU() )
                 elif (last_norm== 'Layer'):
-                    ds_cnn_layers.append( nn.LayerNorm([num_filters, t_dim, f_dim], elementwise_affine=False) )
-            
+                    # GroupNorm(1, C, affine=False) is numerically identical to
+                    # LayerNorm([C, T, F], elementwise_affine=False): both normalise
+                    # the full (C, T, F) feature map per sample with no learnable
+                    # affine. Switching gets us shape-agnostic encoder weights so
+                    # variable-length inputs are supported.
+                    ds_cnn_layers.append( nn.GroupNorm(1, num_filters, affine=False) )
+
             t_dim = math.ceil(t_dim/float(conv_st[layer_no]))
             f_dim = math.ceil(f_dim/float(conv_sf[layer_no]))
 
-                
+
         self.dscnn = nn.Sequential(*ds_cnn_layers)
         self.embedding_features = num_filters
 
-        self.avgpool = nn.AvgPool2d(kernel_size=(t_dim, f_dim), stride=1) 
-        self.flatten = Flatten() 
-        
-        
-    def forward(self, x):
+        # AdaptiveAvgPool2d((1,1)) is identical to AvgPool2d(kernel=(t_dim,f_dim))
+        # when the input matches the original shape, but accepts any T'/F' so we
+        # can feed variable-length inputs.
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.flatten = Flatten()
+
+        # T-dim stride chain for mask-aware GAP at variable length.
+        # Only used when forward() receives non-None `lengths`.
+        self.t_strides = tuple(conv_st)
+
+
+    def forward(self, x, lengths=None):
+        """
+        x       : (B, 1, T, F) feature map (post-MFCC)
+        lengths : (B,) valid frame count per sample, in MFCC-frame units.
+                  If None, fall back to global GAP (equivalent to the original
+                  fixed-shape AvgPool when all inputs share T).
+        """
         x = self.dscnn(x)
-        if self.return_feat_maps:
+        # getattr fallback keeps backwards compat with pickled old ReprModel
+        # instances that predate these attributes
+        if getattr(self, 'return_feat_maps', False):
             return x
-        x = self.avgpool(x)
+        strides = getattr(self, 't_strides', None)
+        if lengths is None or strides is None:
+            x = self.avgpool(x)
+        else:
+            L = lengths.to(x.device).long()
+            for s in strides:
+                if s > 1:
+                    L = (L + s - 1).div(s, rounding_mode='floor')
+            L = L.clamp(min=1)
+            Tf = x.size(2)
+            t_idx = torch.arange(Tf, device=x.device)
+            mask = (t_idx.unsqueeze(0) < L.unsqueeze(1)).to(x.dtype)
+            mask = mask[:, None, :, None]      # (B, 1, T', 1)
+            denom = L.to(x.dtype) * x.size(3)  # valid T' × F'
+            denom = denom[:, None, None, None]
+            x = (x * mask).sum(dim=(2, 3), keepdim=True) / denom
         x = self.flatten(x)
         return x
 

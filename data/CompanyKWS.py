@@ -32,6 +32,31 @@ RANDOM_SEED = 59185
 BACKGROUND_DIR_SUFFIX = '_background'
 
 
+def variable_length_collate(batch):
+    """Collator for variable-length raw-waveform batches.
+
+    Each item is the dict produced by CompanyKWSDataset's transforms:
+        {'data': (C, T_i) float tensor, 'label_idx': scalar, 'label': str, ...}
+    Output: same keys plus 'lengths' (B,) holding the original T_i.
+    'data' is zero-padded on the right to batch-max T.
+
+    Works unchanged for fixed-length modes (T_i is constant → no padding).
+    Picklable (top-level def), so it survives multi-worker DataLoader.
+    """
+    from torch.utils.data._utils.collate import default_collate
+    lengths = torch.tensor([b['data'].size(-1) for b in batch], dtype=torch.long)
+    T_max = int(lengths.max())
+    sample0 = batch[0]['data']
+    data = torch.zeros(len(batch), sample0.size(0), T_max, dtype=sample0.dtype)
+    for i, b in enumerate(batch):
+        T_i = b['data'].size(-1)
+        data[i, :, :T_i] = b['data']
+    out = default_collate([{k: v for k, v in b.items() if k != 'data'} for b in batch])
+    out['data'] = data
+    out['lengths'] = lengths
+    return out
+
+
 class EpisodicFixedBatchSampler(object):
     def __init__(self, n_classes, n_way, n_episodes, fixed_silence_unknown=False, include_unknown=True):
         self.n_classes = n_classes
@@ -88,8 +113,11 @@ class CompanyKWSDataset:
 
         self.channel = args.get('channel', 'ch07')
         self.crop_strategy = args.get('crop_strategy', 'center')
-        if self.crop_strategy not in ('center', 'energy', 'stretch'):
-            raise ValueError("crop_strategy must be 'center', 'energy', or 'stretch', got {}".format(self.crop_strategy))
+        if self.crop_strategy not in ('center', 'energy', 'stretch', 'pad'):
+            raise ValueError("crop_strategy must be 'center', 'energy', 'stretch' or 'pad', got {}".format(self.crop_strategy))
+        # 'pad' mode upper bound; samples longer than this get energy-cropped.
+        self.max_duration_ms = int(args.get('max_duration_ms', 3100))
+        self.max_duration_samples = int(self.sample_rate * self.max_duration_ms / 1000)
         self.merge_val = args.get('merge_val', 'none')
         if self.merge_val not in ('none', 'train', 'test'):
             raise ValueError("merge_val must be 'none', 'train' or 'test', got {}".format(self.merge_val))
@@ -263,26 +291,27 @@ class CompanyKWSDataset:
         if d[key_label] == UNKNOWN_WORD_LABEL:
             return d
         foreground = d[k]
+        audio_len = foreground.size(1)   # matches desired_samples in fixed modes, variable in pad mode
         has_bg = len(self.background_data) > 0
         if has_bg and (use_background or d[key_label] == SILENCE_LABEL):
             background_index = np.random.randint(len(self.background_data))
             background_samples = self.background_data[background_index]
-            if len(background_samples) <= self.desired_samples:
+            if len(background_samples) <= audio_len:
                 # too short — skip mixing for this sample
-                background_reshaped = torch.zeros(1, self.desired_samples)
+                background_reshaped = torch.zeros(1, audio_len)
                 bg_vol = 0
             else:
                 background_offset = np.random.randint(
-                    0, len(background_samples) - self.desired_samples)
+                    0, len(background_samples) - audio_len)
                 background_clipped = background_samples[background_offset:(
-                    background_offset + self.desired_samples)]
-                background_reshaped = background_clipped.reshape([1, self.desired_samples])
+                    background_offset + audio_len)]
+                background_reshaped = background_clipped.reshape([1, audio_len])
                 if np.random.uniform(0, 1) < self.background_frequency:
                     bg_vol = np.random.uniform(0, self.background_volume)
                 else:
                     bg_vol = 0
         else:
-            background_reshaped = torch.zeros(1, self.desired_samples)
+            background_reshaped = torch.zeros(1, audio_len)
             bg_vol = 0
 
         background_mul = background_reshaped * bg_vol
@@ -291,6 +320,13 @@ class CompanyKWSDataset:
         return d
 
     def shift_and_pad(self, key, d):
+        # Pad mode keeps samples at their native variable length — the random
+        # time-shift trick depends on a fixed desired_samples window, so we skip
+        # the augmentation entirely here. (Time-shift on already-variable
+        # samples isn't meaningful: the wake word is already where it is.)
+        if self.crop_strategy == 'pad':
+            return d
+
         audio = d[key]
         time_shift = int((self.time_shift_ms * self.sample_rate) / 1000)
         if time_shift > 0:
@@ -323,26 +359,35 @@ class CompanyKWSDataset:
         # Shallow-copy so we don't permanently mutate the underlying record dict
         # (torchnet's ListDataset returns the same instance on each access).
         d = dict(d)
-        target_len = self.desired_samples + int(self.time_shift_ms * self.sample_rate / 1000)
+        # Fixed-length modes pre-allocate target_len = desired + max time-shift so
+        # the subsequent shift_and_pad has slack to slide within. Pad mode keeps
+        # samples native up to max_duration_samples (energy-cropped if longer).
+        if self.crop_strategy == 'pad':
+            target_len = self.max_duration_samples
+        else:
+            target_len = self.desired_samples + int(self.time_shift_ms * self.sample_rate / 1000)
 
-        # Background slice path: read a fixed offset chunk; bypass crop_strategy.
+        # Background slice path (GSC / LibriSpeech / wake-word backgrounds):
+        # always read a fixed 1s-ish chunk regardless of crop_strategy — these
+        # are the _unknown_ negatives and pretrained as ~1s.
         bg_offset_s = d.pop('bg_offset_seconds', None)
         if bg_offset_s is not None:
+            bg_target_len = self.desired_samples + int(self.time_shift_ms * self.sample_rate / 1000)
             info = torchaudio.info(d[key_path])
             src_sr = info.sample_rate
             src_offset = int(bg_offset_s * src_sr)
-            # Read a slightly larger window in source rate so resample lands on >= target_len.
-            src_n_frames = int((target_len / self.sample_rate + 0.05) * src_sr)
+            # Read a slightly larger window in source rate so resample lands on >= bg_target_len.
+            src_n_frames = int((bg_target_len / self.sample_rate + 0.05) * src_sr)
             sound, sr = torchaudio.load(d[key_path], normalize=True,
                                         frame_offset=src_offset, num_frames=src_n_frames)
             if sound.size(0) > 1:
                 sound = sound.mean(dim=0, keepdim=True)
             if sr != self.sample_rate:
                 sound = AF.resample(sound, sr, self.sample_rate)
-            if sound.size(1) > target_len:
-                sound = sound[:, :target_len]
-            elif sound.size(1) < target_len:
-                sound = F.pad(sound, (0, target_len - sound.size(1)))
+            if sound.size(1) > bg_target_len:
+                sound = sound[:, :bg_target_len]
+            elif sound.size(1) < bg_target_len:
+                sound = F.pad(sound, (0, bg_target_len - sound.size(1)))
             d[out_field] = sound
             return d
 
@@ -351,12 +396,19 @@ class CompanyKWSDataset:
             sound = sound.mean(dim=0, keepdim=True)
         if sr != self.sample_rate:
             sound = AF.resample(sound, sr, self.sample_rate)
-        # Crop/stretch to a window slightly longer than desired_samples; shift_and_pad will trim/pad.
+
         if self.crop_strategy == 'stretch':
             sound = self._stretch_to_target(sound, target_len)
+        elif self.crop_strategy == 'pad':
+            # Variable-length: only crop the tail (>3.1s) via energy peak;
+            # keep native length otherwise.
+            if sound.size(1) > target_len:
+                start = self._energy_crop_start(sound, target_len)
+                sound = sound[:, start:start + target_len]
         elif sound.size(1) > target_len:
             start = self._pick_crop_start(sound, target_len)
             sound = sound[:, start:start + target_len]
+
         if d[key_label] == SILENCE_LABEL:
             sound = torch.zeros(1, self.desired_samples)
         d[out_field] = sound
@@ -365,11 +417,15 @@ class CompanyKWSDataset:
     def _pick_crop_start(self, sound, max_len):
         if self.crop_strategy == 'center':
             return (sound.size(1) - max_len) // 2
-        # 'energy': pick the max-RMS window of size max_len.
-        # Use a coarse hop (~10ms) for speed; we only need rough peak localization.
+        return self._energy_crop_start(sound, max_len)
+
+    def _energy_crop_start(self, sound, max_len):
+        """Return the start sample of the max-RMS window of `max_len` samples.
+
+        Coarse 10ms hop is enough — we only need rough peak localisation.
+        """
         hop = max(1, int(0.01 * self.sample_rate))
         sq = sound.pow(2).sum(dim=0)  # (T,)
-        # Cumulative sum trick for O(T) windowed energy.
         csum = torch.cat([torch.zeros(1, dtype=sq.dtype), sq.cumsum(0)])
         T = sq.size(0)
         n_starts = (T - max_len) // hop + 1
@@ -377,8 +433,7 @@ class CompanyKWSDataset:
             return 0
         starts = torch.arange(n_starts) * hop
         win_energy = csum[starts + max_len] - csum[starts]
-        best = int(starts[win_energy.argmax()].item())
-        return best
+        return int(starts[win_energy.argmax()].item())
 
     def _stretch_to_target(self, sound, target_len):
         """Time-stretch waveform to exactly target_len samples.

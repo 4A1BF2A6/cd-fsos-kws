@@ -19,7 +19,7 @@ from tqdm import tqdm
 
 # noqa: F401 — registers model builders
 import models
-from data.CompanyKWS import CompanyKWSDataset
+from data.CompanyKWS import CompanyKWSDataset, variable_length_collate
 from metrics import compute_metrics
 
 
@@ -31,7 +31,13 @@ DSCNNL_EMB_DIM = 276    # DSCNNL_LAYERNORM output dim
 # ---------------------------------------------------------------------------
 
 class KWSClassifier(nn.Module):
-    """DSCNN encoder (frozen by default) + Linear classification head."""
+    """DSCNN encoder (frozen by default) + Linear classification head.
+
+    Supports both fixed-length (legacy, lengths=None) and variable-length
+    (lengths=raw-sample-count) inputs. Variable length routes through
+    mask-aware GAP inside the encoder so zero-padded positions don't
+    dilute the embedding.
+    """
 
     def __init__(self, encoder_ckpt, n_classes, freeze_encoder=True):
         super().__init__()
@@ -40,17 +46,48 @@ class KWSClassifier(nn.Module):
         # legacy checkpoints may lack newer attrs added to MFCC
         if hasattr(self.preprocessing, 'mfcc') and not hasattr(self.preprocessing, 'force_cpu'):
             self.preprocessing.force_cpu = False
-        self.encoder = repr_model.encoder
-        self.encoder.return_feat_maps = False
+
+        # Rebuild encoder against the current (variable-length) DSCNN code,
+        # then port the pretrained weights over. The old/new architectures
+        # differ only in AvgPool↔AdaptiveAvgPool and LayerNorm↔GroupNorm —
+        # neither has learnable params, so state_dict keys & shapes match.
+        from models.encoder.DSCNN import DSCNNL_LAYERNORM
+        old_encoder = repr_model.encoder
+        new_encoder = DSCNNL_LAYERNORM([1, 49, 10])
+        new_encoder.load_state_dict(old_encoder.state_dict(), strict=True)
+        new_encoder.return_feat_maps = False
+        self.encoder = new_encoder
+
         if freeze_encoder:
             for p in self.encoder.parameters():
                 p.requires_grad = False
         self.head = nn.Linear(DSCNNL_EMB_DIM, n_classes)
 
-    def forward(self, x):
-        # x: (B, 1, T_samples) raw waveform
+        # MFCC win/hop in raw samples — used to convert sample-length → frame-length.
+        # Pull from the preprocessing wrapper so we honour whatever the ckpt was
+        # configured with (currently 40/20 ms @ 16 kHz).
+        prep = self.preprocessing
+        self._mfcc_win = int(round(prep.window_size_ms / 1000 * prep.sample_rate))
+        self._mfcc_hop = int(round(prep.window_stride_ms / 1000 * prep.sample_rate))
+
+    def _samples_to_frames(self, sample_lengths):
+        """raw waveform samples → MFCC frame count (matches center=False)."""
+        T = sample_lengths.to(torch.long)
+        frames = ((T - self._mfcc_win).clamp(min=0)) // self._mfcc_hop + 1
+        return frames.clamp(min=1)
+
+    def forward(self, x, lengths=None):
+        """
+        x       : (B, 1, T_samples) raw waveform (zero-padded if variable).
+        lengths : (B,) int tensor of valid sample counts. None → fixed-length
+                  legacy path (encoder does global GAP, identical to old AvgPool).
+        """
         feat = self.preprocessing.extract_features(x)   # (B, 1, T_frames, F)
-        emb = self.encoder(feat)                         # (B, 276) — unnormalised
+        if lengths is None:
+            emb = self.encoder(feat)
+        else:
+            mfcc_lengths = self._samples_to_frames(lengths)
+            emb = self.encoder(feat, lengths=mfcc_lengths)
         return self.head(emb)                            # (B, n_classes)
 
 
@@ -77,6 +114,7 @@ def build_speech_args(args):
         'include_unknown':  True,
         'channel':          args.channel,
         'crop_strategy':    args.crop_strategy,
+        'max_duration_ms':  args.max_duration_ms,
         'merge_val':        'none',     # keep val standalone for early stopping
         'gsc_unknown_dir':  args.gsc_dir,
         'gsc_unknown_words': args.gsc_unknown_words,
@@ -100,13 +138,19 @@ def make_weighted_sampler(records, word_to_index):
 
 
 def get_iid_dataloader_balanced(ds, split, batch_size, num_workers=4, pin_memory=True):
-    """Like ds.get_iid_dataloader but with WeightedRandomSampler for balance."""
+    """Like ds.get_iid_dataloader but with WeightedRandomSampler for balance.
+
+    Uses variable_length_collate so pad-mode datasets pad to batch-max and
+    surface a `lengths` tensor. For fixed-length modes it's a no-op pad
+    (all samples already same length) plus a `lengths` tensor.
+    """
     records = ds.data_set[split]
     transforms_ds = ds.get_transform_dataset(records, list(ds.words_list))
     sampler = make_weighted_sampler(records, ds.word_to_index)
     return DataLoader(transforms_ds, batch_size=batch_size, sampler=sampler,
                       num_workers=num_workers, pin_memory=pin_memory,
-                      persistent_workers=num_workers > 0)
+                      persistent_workers=num_workers > 0,
+                      collate_fn=variable_length_collate)
 
 
 # ---------------------------------------------------------------------------
@@ -122,7 +166,10 @@ def collect_predictions(model, loader, n_classes, unk_id, device,
 
     for batch in tqdm(loader, desc=desc, leave=False):
         x = batch['data'].to(device)
-        logits = model(x)
+        lengths = batch.get('lengths')
+        if lengths is not None:
+            lengths = lengths.to(device)
+        logits = model(x, lengths=lengths)
         p_y = F.softmax(logits, dim=1).cpu()
         _, pred = p_y.max(1)
         conf = p_y.gather(1, pred.unsqueeze(1)).squeeze(1)
@@ -160,7 +207,8 @@ def evaluate(model, ds, split, batch_size, device):
 
     pos_records = ds.dataset_filter_class(ds.data_set[split], pos_classes)
     pos_loader = DataLoader(ds.get_transform_dataset(pos_records, pos_classes),
-                            batch_size=batch_size, shuffle=False)
+                            batch_size=batch_size, shuffle=False,
+                            collate_fn=variable_length_collate)
     y_score_p, y_pred_p, y_true_p, y_close_p, y_ood_p = collect_predictions(
         model, pos_loader, n_classes, unk_id, device, desc=f'{split} pos')
 
@@ -168,7 +216,8 @@ def evaluate(model, ds, split, batch_size, device):
         neg_records = ds.dataset_filter_class(ds.data_set[split], neg_classes)
         if neg_records:
             neg_loader = DataLoader(ds.get_transform_dataset(neg_records, neg_classes),
-                                    batch_size=batch_size, shuffle=False)
+                                    batch_size=batch_size, shuffle=False,
+                                    collate_fn=variable_length_collate)
             y_score_n, y_pred_n, y_true_n, y_close_n, y_ood_n = collect_predictions(
                 model, neg_loader, n_classes, unk_id, device,
                 force_unk_labels=True, desc=f'{split} neg')
@@ -194,8 +243,13 @@ def main():
     parser.add_argument('--datadir', required=True, help='CompanyKWS root dir')
     parser.add_argument('--gsc_dir', required=True, help='GSC speech_commands_v0.02 root')
     parser.add_argument('--channel', default='ch07')
-    parser.add_argument('--crop_strategy', default='stretch',
-                        choices=['center', 'energy', 'stretch'])
+    parser.add_argument('--crop_strategy', default='pad',
+                        choices=['center', 'energy', 'stretch', 'pad'],
+                        help="'pad' keeps native variable length (recommended). "
+                             "Use 'stretch' to reproduce the old fixed-1s training.")
+    parser.add_argument('--max_duration_ms', type=int, default=3100,
+                        help="Upper bound for crop_strategy='pad' (energy-crop "
+                             'longer samples). Default 3100 (CompanyKWS P99).')
     parser.add_argument('--gsc_unknown_words', type=str,
                         default='backward,forward,visual,follow,learn,bed,bird,cat,dog')
     parser.add_argument('--librispeech_dir', default=None,
@@ -272,7 +326,10 @@ def main():
         for batch in tqdm(train_loader, desc=f'Epoch {epoch+1}/{args.epochs}'):
             x = batch['data'].to(device, non_blocking=True)
             y = batch['label_idx'].to(device, non_blocking=True)
-            logits = model(x)
+            lengths = batch.get('lengths')
+            if lengths is not None:
+                lengths = lengths.to(device, non_blocking=True)
+            logits = model(x, lengths=lengths)
             loss = ce_loss(logits, y)
             optimizer.zero_grad()
             loss.backward()
