@@ -99,15 +99,38 @@ parser.add_argument('--speech.foreground_volume', type=float, default=1)
 parser.add_argument('--speech.channel', type=str, default='ch07',
                     help='which channel wav to load for CompanyKWS, e.g. ch01/ch07 (default: ch07)')
 parser.add_argument('--speech.crop_strategy', type=str, default='center',
-                    choices=['center', 'energy'],
+                    choices=['center', 'energy', 'stretch'],
                     help='how to crop variable-length audio to clip_duration: '
-                         'center (geometric middle) or energy (1s window with max RMS energy). '
+                         'center (geometric middle), energy (1s window with max RMS energy), '
+                         'or stretch (time-stretch whole utterance to 1s via resampling). '
                          'Only used by CompanyKWS wrapper. Default: center')
 parser.add_argument('--speech.merge_val', type=str, default='none',
                     choices=['none', 'train', 'test'],
                     help='how to absorb the validation split when it is otherwise unused: '
                          'none keeps it standalone; train merges into training; '
                          'test merges into testing. Only used by CompanyKWS wrapper. Default: none')
+parser.add_argument('--speech.gsc_unknown_dir', type=str, default=None,
+                    help='GSC root dir (speech_commands_v0.02/); if set, injects GSC words as '
+                         'harder _unknown_ negatives into CompanyKWS testing split')
+parser.add_argument('--speech.gsc_unknown_words', type=str,
+                    default='backward,forward,visual,follow,learn,bed,bird,cat,dog',
+                    help='comma-separated GSC words to use as unknown negatives '
+                         '(only used when --speech.gsc_unknown_dir is set)')
+parser.add_argument('--speech.gsc_unknown_splits', type=str, default='test',
+                    choices=['test', 'all'],
+                    help='test: inject GSC unknowns into testing only (default); '
+                         'all: split 80/20 into training+testing so the support-set '
+                         '_unknown_ prototype is built from human speech')
+parser.add_argument('--speech.librispeech_dir', type=str, default=None,
+                    help='LibriSpeech root (e.g. .../train-clean-100/). If set, '
+                         'inject random 1s slices of continuous English speech as '
+                         '_unknown_ negatives (always 80/20 train/test split)')
+parser.add_argument('--speech.librispeech_samples_per_file', type=int, default=2,
+                    help='How many random 1s slices to extract from each LibriSpeech '
+                         'utterance (default: 2)')
+parser.add_argument('--speech.librispeech_max_files', type=int, default=0,
+                    help='Cap on number of LibriSpeech .flac files to use; 0 = no cap '
+                         '(default: 0). Useful to control _unknown_ pool size.')
 
 parser.add_argument('--speech.include_noise', action='store_true', default=True, help="one of the classes out of n should be unknown (default: False)")
 parser.add_argument('--speech.noise_snr', type=int, default=5, help='time shift the audio in milliseconds')

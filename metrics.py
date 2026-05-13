@@ -94,11 +94,11 @@ def compute_metrics(    y_score_pos, y_pred_pos, y_true_pos, y_pred_close_pos, y
     '''
     acc_xxfar = thr_xxfar = frr_xxfar = cerr_xxfar = 0.0
     # search thr at target_far FAR
-    print(fpr, tpr, thresholds)
+    # print(fpr, tpr, thresholds)
     th_idx = -1
     for i,item in enumerate(fpr):
         if item > target_far:
-            print(item, i, tpr[th_idx])
+            # print(item, i, tpr[th_idx])
             break
         else:
             th_idx = i

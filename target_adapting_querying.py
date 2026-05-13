@@ -238,8 +238,11 @@ if __name__ == '__main__':
     print("Evaluating model in a few-shot setting ({}-way | {}-shots) for {} episodes on the task {} of the Dataset {}".format(
             n_way,n_support, n_episodes, task, dataset))
     output = {'test':{}}
-    
-    # 
+    _rtf_audio_s = 0.0
+    _rtf_infer_s = 0.0
+    _best_score = -1.0
+    _best_ep = -1
+
     for ep, support_sample in enumerate(train_episodic_loader):
         '''
             1.load model & prepare data
@@ -362,13 +365,34 @@ if __name__ == '__main__':
             Few-shot test in open set
             NB: _unknown_ is the negative class as part of the class_list
         '''  
-        # test on positive dataset     
+        # test on positive dataset
         print('\n Test Episode {} with classes: {}'.format(ep, class_list))
 
+        # one-time FLOPs estimate using torch profiler
+        if ep == 0:
+            try:
+                import torch.profiler
+                _dummy = torch.zeros(1, 1, speech_args['sample_rate'],
+                                     device='cuda' if cuda else 'cpu')
+                with torch.profiler.profile(with_flops=True) as _prof:
+                    model.get_embeddings(_dummy)
+                _flops = sum(e.flops or 0 for e in _prof.key_averages())
+                if _flops > 0:
+                    print('[RTF] Approx FLOPs per 1s query: {:.3f} MFLOPs'.format(_flops / 1e6))
+                else:
+                    print('[RTF] FLOPs: not reported by profiler')
+            except Exception as _exc:
+                print('[RTF] FLOPs estimate unavailable:', _exc)
+
         # load only samples from the target classes and not negative _unknown_
-        query_loader = ds.get_iid_dataloader('testing', opt['fsl.test.batch_size'], 
+        query_loader = ds.get_iid_dataloader('testing', opt['fsl.test.batch_size'],
             class_list = [x for x in class_list if 'unknown' not in x])
+        if cuda: torch.cuda.synchronize()
+        _t0 = time.perf_counter()
         y_score_pos, y_pred_pos, y_true_pos, y_pred_close_pos, y_pred_ood_pos = test_model(query_loader, classifier, unk_idx)
+        if cuda: torch.cuda.synchronize()
+        _rtf_infer_s += time.perf_counter() - _t0
+        _rtf_audio_s += len(y_score_pos) * 1.0
 
         # test on the negative dataset (_unknown_) if present
         if ds_neg is not None:
@@ -391,6 +415,39 @@ if __name__ == '__main__':
             meter.add(output_ep[field])
         output[str(ep)] = output_ep
 
+        # save best episode: adapted model weights + prototypes
+        # acc_far05 when open-set (_unknown_ present), accuracy_pos for closed-set.
+        ep_score = output_ep['acc_far05'] if speech_args['include_unknown'] else output_ep['accuracy_pos']
+        if ep_score > _best_score:
+            _best_score = ep_score
+            _best_ep = ep
+            _save_dir = os.path.dirname(opt['model.model_path'])
+            torch.save(model.state_dict(),
+                       os.path.join(_save_dir, 'best_adapted_model.pt'))
+            adapting_opt = {k: v for k, v in opt.items() if k.startswith('adapting')}
+            torch.save({
+                'muK': classifier.muK.cpu(),
+                'word_to_index': classifier.word_to_index,
+                'class_list': classifier.class_list,
+                'beta': classifier.beta.detach().cpu(),
+                'model_opt': model_opt,
+                'adapting_opt': adapting_opt,
+                'criterion': model_opt.get('loss', {}),
+                'x_dim': model_opt['x_dim'],
+                'speech_args': speech_args,
+                'data_dir': data_dir,
+                'task': pos_task,
+                'cuda': opt['data.cuda'],
+                'ep': ep,
+                'accuracy_pos': output_ep['accuracy_pos'],
+                'acc_far05': output_ep['acc_far05'],
+                'thr_far05': output_ep.get('thr_far05'),
+                'aucROC': output_ep['aucROC'],
+            }, os.path.join(_save_dir, 'best_prototypes.pt'))
+            score_name = 'acc_far05' if speech_args['include_unknown'] else 'accuracy_pos'
+            print('[Best] ep={} {}={:.4f} → saved to {}'.format(
+                ep, score_name, ep_score, _save_dir))
+
 
     for field,meter in meters.items():
         mean, std = meter.value()
@@ -398,6 +455,13 @@ if __name__ == '__main__':
         output["test"][field]["mean"] = mean
         output["test"][field]["std"] = std
         print("Final Test: Avg {} is {} with std dev {}".format(field, mean, std))
+
+    if _rtf_audio_s > 0:
+        print('RTF = {:.4f}  ({:.2f}s infer / {:.1f}s audio, query-only)'.format(
+            _rtf_infer_s / _rtf_audio_s, _rtf_infer_s, _rtf_audio_s))
+    _score_name = 'acc_far05' if speech_args['include_unknown'] else 'accuracy_pos'
+    print('[Best] ep={} {}={:.4f} → best_adapted_model.pt / best_prototypes.pt'.format(
+        _best_ep, _score_name, _best_score))
 
     # write log
     if speech_args['include_unknown']:

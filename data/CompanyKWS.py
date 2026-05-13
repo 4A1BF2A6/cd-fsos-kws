@@ -88,11 +88,19 @@ class CompanyKWSDataset:
 
         self.channel = args.get('channel', 'ch07')
         self.crop_strategy = args.get('crop_strategy', 'center')
-        if self.crop_strategy not in ('center', 'energy'):
-            raise ValueError("crop_strategy must be 'center' or 'energy', got {}".format(self.crop_strategy))
+        if self.crop_strategy not in ('center', 'energy', 'stretch'):
+            raise ValueError("crop_strategy must be 'center', 'energy', or 'stretch', got {}".format(self.crop_strategy))
         self.merge_val = args.get('merge_val', 'none')
         if self.merge_val not in ('none', 'train', 'test'):
             raise ValueError("merge_val must be 'none', 'train' or 'test', got {}".format(self.merge_val))
+        self.gsc_unknown_dir = args.get('gsc_unknown_dir', None)
+        self.gsc_unknown_words = [w.strip() for w in
+            args.get('gsc_unknown_words', 'backward,forward,visual,follow,learn').split(',') if w.strip()]
+        self.gsc_unknown_splits = args.get('gsc_unknown_splits', 'test')
+        # LibriSpeech continuous-speech unknown augmentation
+        self.librispeech_dir = args.get('librispeech_dir', None)
+        self.librispeech_samples_per_file = int(args.get('librispeech_samples_per_file', 2))
+        self.librispeech_max_files = int(args.get('librispeech_max_files', 0))  # 0 = no cap
         self.data_cache = {}
         self.data_dir = data_dir
 
@@ -343,8 +351,10 @@ class CompanyKWSDataset:
             sound = sound.mean(dim=0, keepdim=True)
         if sr != self.sample_rate:
             sound = AF.resample(sound, sr, self.sample_rate)
-        # Crop to a window slightly longer than desired_samples; shift_and_pad will trim/pad.
-        if sound.size(1) > target_len:
+        # Crop/stretch to a window slightly longer than desired_samples; shift_and_pad will trim/pad.
+        if self.crop_strategy == 'stretch':
+            sound = self._stretch_to_target(sound, target_len)
+        elif sound.size(1) > target_len:
             start = self._pick_crop_start(sound, target_len)
             sound = sound[:, start:start + target_len]
         if d[key_label] == SILENCE_LABEL:
@@ -369,6 +379,21 @@ class CompanyKWSDataset:
         win_energy = csum[starts + max_len] - csum[starts]
         best = int(starts[win_energy.argmax()].item())
         return best
+
+    def _stretch_to_target(self, sound, target_len):
+        """Time-stretch waveform to exactly target_len samples.
+
+        Uses linear interpolation (F.interpolate) instead of sinc resampling —
+        10-20x faster on CPU, sufficient quality for MFCC feature extraction.
+        """
+        orig_len = sound.size(1)
+        if orig_len == target_len:
+            return sound
+        # F.interpolate expects (N, C, L); sound is (1, L)
+        stretched = F.interpolate(
+            sound.unsqueeze(0), size=target_len, mode='linear', align_corners=False
+        ).squeeze(0)
+        return stretched
 
     def load_background_data(self):
         background_data = []
@@ -484,6 +509,113 @@ class CompanyKWSDataset:
                         'file': silence_wav_path,
                         'speaker': 'None',
                     })
+
+        # Inject GSC human-speech words as harder _unknown_ negatives
+        if self.unknown and self.gsc_unknown_dir:
+            gsc_entries = []
+            for word in self.gsc_unknown_words:
+                word_dir = os.path.join(self.gsc_unknown_dir, word)
+                if not os.path.isdir(word_dir):
+                    print('[CompanyKWS] GSC word dir not found, skipping: {}'.format(word_dir))
+                    continue
+                for wav in glob.glob(os.path.join(word_dir, '*.wav')):
+                    gsc_entries.append({'label': UNKNOWN_WORD_LABEL, 'file': wav, 'speaker': 'gsc_unknown'})
+            if gsc_entries:
+                rng_gsc = random.Random(RANDOM_SEED + 13)
+                rng_gsc.shuffle(gsc_entries)
+                if self.gsc_unknown_splits == 'all':
+                    # 80% train / 10% val / 10% test, mirroring CompanyKWS percentages
+                    n = len(gsc_entries)
+                    n_train = int(n * 0.8)
+                    n_val   = int(n * 0.1)
+                    self.data_set['training'].extend(gsc_entries[:n_train])
+                    self.data_set['validation'].extend(gsc_entries[n_train:n_train + n_val])
+                    self.data_set['testing'].extend(gsc_entries[n_train + n_val:])
+                    print('[CompanyKWS] Added {} GSC unknown entries '
+                          '(train={}, val={}, test={})'.format(
+                              n, n_train, n_val, n - n_train - n_val))
+                else:
+                    self.data_set['testing'].extend(gsc_entries)
+                    print('[CompanyKWS] Added {} GSC unknown entries to testing split'.format(
+                        len(gsc_entries)))
+
+        # Inject LibriSpeech continuous-speech slices as harder _unknown_ negatives.
+        # Speaker-disjoint split (80/10/10): same speaker never appears in two splits,
+        # otherwise the model can memorise speaker-specific cues and fake high val FAR.
+        if self.unknown and self.librispeech_dir:
+            min_dur = self.clip_duration_ms / 1000.0 + 0.2
+            slice_dur = self.clip_duration_ms / 1000.0
+            flac_paths = sorted(glob.glob(os.path.join(
+                self.librispeech_dir, '**', '*.flac'), recursive=True))
+            if self.librispeech_max_files > 0 and len(flac_paths) > self.librispeech_max_files:
+                rng_cap = random.Random(RANDOM_SEED + 23)
+                rng_cap.shuffle(flac_paths)
+                flac_paths = flac_paths[:self.librispeech_max_files]
+
+            # LibriSpeech path: <root>/<speaker_id>/<chapter_id>/<file>.flac
+            #                                   ↑ third-from-last
+            def _ls_speaker(path):
+                parts = path.split(os.sep)
+                return parts[-3] if len(parts) >= 3 else 'unknown_speaker'
+
+            # Group files by speaker; split speakers (not files) into 80/10/10
+            speaker_to_files = {}
+            for f in flac_paths:
+                speaker_to_files.setdefault(_ls_speaker(f), []).append(f)
+            ls_speakers = sorted(speaker_to_files.keys())
+            rng_split = random.Random(RANDOM_SEED + 31)
+            rng_split.shuffle(ls_speakers)
+            n_spk = len(ls_speakers)
+            n_train_spk = int(n_spk * 0.8)
+            n_val_spk   = int(n_spk * 0.1)
+            spk_split = {
+                'training':   set(ls_speakers[:n_train_spk]),
+                'validation': set(ls_speakers[n_train_spk:n_train_spk + n_val_spk]),
+                'testing':    set(ls_speakers[n_train_spk + n_val_spk:]),
+            }
+
+            rng_ls = random.Random(RANDOM_SEED + 17)
+            per_split_entries = {'training': [], 'validation': [], 'testing': []}
+            n_skipped_short = 0
+
+            for f in flac_paths:
+                spk = _ls_speaker(f)
+                target_split = (
+                    'training'   if spk in spk_split['training']   else
+                    'validation' if spk in spk_split['validation'] else
+                    'testing'
+                )
+                try:
+                    info = torchaudio.info(f)
+                    dur = info.num_frames / info.sample_rate
+                except Exception as exc:
+                    print('[CompanyKWS] LibriSpeech info failed {}: {}'.format(f, exc))
+                    continue
+                if dur < min_dur:
+                    n_skipped_short += 1
+                    continue
+                max_offset = dur - slice_dur - 0.05
+                for _ in range(self.librispeech_samples_per_file):
+                    offset = rng_ls.uniform(0.0, max_offset)
+                    per_split_entries[target_split].append({
+                        'label': UNKNOWN_WORD_LABEL,
+                        'file': f,
+                        'speaker': 'librispeech_' + spk,
+                        'bg_offset_seconds': offset,
+                    })
+
+            for split, entries in per_split_entries.items():
+                self.data_set[split].extend(entries)
+            total = sum(len(v) for v in per_split_entries.values())
+            print('[CompanyKWS] LibriSpeech speaker-disjoint split '
+                  '({} speakers → train/val/test = {}/{}/{}) → '
+                  '{} slices (train={}, val={}, test={}, skipped_short={})'.format(
+                      n_spk, n_train_spk, n_val_spk, n_spk - n_train_spk - n_val_spk,
+                      total,
+                      len(per_split_entries['training']),
+                      len(per_split_entries['validation']),
+                      len(per_split_entries['testing']),
+                      n_skipped_short))
 
         # optionally absorb validation into another split (default: keep standalone)
         if self.merge_val == 'train' and self.data_set['validation']:

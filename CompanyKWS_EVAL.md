@@ -79,8 +79,10 @@ python target_adapting_querying.py \
 | `--speech.task` | 任务名 | `CompanyKWS_ALL` 用全部 wake；或 `wake_a,wake_b,...` 显式列举 |
 | `--speech.default_datadir` | 数据根目录 | 必须以 `/` 结尾，指向上节布局的 `<root>/` |
 | `--speech.channel` | 取哪一路通道 | 默认 `ch07`（DSP 增强）；想看原始阵列效果改 `ch01` |
-| `--speech.crop_strategy` | 变长音频裁剪策略 | `center` 取几何中段；`energy` 用 1s 滑窗找 RMS 能量峰值（默认 `center`，唤醒词尾音重要时建议 `energy`） |
+| `--speech.crop_strategy` | 变长音频裁剪策略 | `center` 取几何中段；`energy` 用 1s 滑窗找 RMS 能量峰值；`stretch` 把整条音频重采样压缩/拉伸到 1s（保留所有音节，推荐用于慢速 ~3.7s 样本） |
 | `--speech.merge_val` | 验证集去向 | `none` 不动；`train` 合进训练集；`test` 合进测试集（默认 `none`，仓库本来不用 val） |
+| `--speech.gsc_unknown_dir` | 更难的负样本来源 | 指向 GSC `speech_commands_v0.02/` 根目录；设了之后把 GSC 人声词条注入 `_unknown_` 类（testing only），让 AUROC 更有参考价值 |
+| `--speech.gsc_unknown_words` | 注入哪些 GSC 词 | 逗号分隔，默认 `backward,forward,visual,follow,learn,bed,bird,cat,dog` |
 | `--speech.include_unknown` | 是否启用 `_unknown_` 类 | 设了之后从背景切片生成 `_unknown_` 样本，触发开集评估 |
 | `--fsl.test.n_way` | 每个 episode 几路分类 | **不能超过实际 wake 数 (+1 if include_unknown)**；纯闭集 task 设成等于 wake 数即可 |
 | `--fsl.test.n_support` | 每类支持样本数 | 5/10 是常用值；少样本场景就该 ≤ 10 |
@@ -220,12 +222,14 @@ python source_pretraining.py \
 
 | 文件 | 作用 |
 |---|---|
-| `data/CompanyKWS.py` | 新数据集 wrapper（变长裁剪、speaker-disjoint 切分、可选 `_unknown_` 背景切片） |
+| `data/CompanyKWS.py` | 新数据集 wrapper（变长裁剪、speaker-disjoint 切分、可选 `_unknown_` 背景切片 + GSC 人声负样本注入、`stretch` 裁剪策略） |
 | `parser_kws.py` | 新增 `--speech.channel` / `--speech.crop_strategy` / `--speech.merge_val` |
 | `target_adapting_querying.py` | 新增 `CompanyKWS` 分发分支 + 修闭集兼容性 bug + 负集 loader fallback |
 | `source_pretraining.py` | 放开 `speech.dataset` 写死覆盖 + 新增 `CompanyKWS` 分发分支 |
 | `metrics.py` | 闭集（`y_score_neg=None`）兜底、`*_prec95` → `*_far05` 重命名 |
 | `models/CKAs_module.py` | `ad_type='none'` 时 `forward` 直接返回，避免引用未创建的 `self.delta` |
+| `target_adapting_querying.py` | 评估脚本新增 RTF / FLOPs 打印（查询阶段计时 + `torch.profiler` 估算） |
+| `demo_sliding_kws.py` | 新增滑窗实时推理演示（`SlidingKWS` 类，对接 3A + Whisper 流水线） |
 | `CompanyKWS_EVAL.md` | 本文档 |
 
 ---
