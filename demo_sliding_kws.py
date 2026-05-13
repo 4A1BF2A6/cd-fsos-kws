@@ -154,6 +154,166 @@ def load_classifier(ckpt_path, device):
 # Sliding window detector
 # ---------------------------------------------------------------------------
 
+class SegmentKWS:
+    """Segment-based KWS detector aligned with variable-length training.
+
+    Instead of sliding a fixed window over continuous audio, we run a simple
+    energy-based VAD state machine to find speech segments, then classify each
+    complete segment as a single variable-length input — exactly matching how
+    the model was trained on variable-length wake-word utterances.
+
+    State machine (each push() = one hop of audio):
+        IDLE → (RMS > start_thr for ≥ speech_onset_frames consecutive hops)
+             → IN_SPEECH (also backfills pre_onset_ms of audio before onset)
+        IN_SPEECH → (RMS < stop_thr for ≥ silence_hangover_frames consecutive hops
+                     OR segment length ≥ max_segment_samples)
+                  → emit segment + classify, → IDLE (cooldown)
+
+    Use this for classifier_mode (mode 3). For prototype-based modes (1/2),
+    SlidingKWS remains the right choice — those models were trained on fixed-
+    length features and don't have variable-length support.
+    """
+
+    def __init__(self, model, labels, *, threshold=0.6, hop_ms=20,
+                 start_thr=0.01, stop_thr=0.005,
+                 speech_onset_ms=60, silence_hangover_ms=300,
+                 min_speech_ms=200, max_segment_ms=3100,
+                 pre_onset_ms=100, cooldown_ms=1000, device, debug=False):
+        self.model = model
+        self.labels = list(labels)
+        self.threshold = threshold
+        self.device = device
+        self.debug = debug
+        self.hop_samples = int(SR * hop_ms / 1000)
+        self.start_thr = start_thr
+        self.stop_thr = stop_thr
+        self.speech_onset_frames = max(1, int(speech_onset_ms / hop_ms))
+        self.silence_hangover_frames = max(1, int(silence_hangover_ms / hop_ms))
+        self.cooldown_frames = max(0, int(cooldown_ms / hop_ms))
+        self.min_speech_samples = int(SR * min_speech_ms / 1000)
+        self.max_segment_samples = int(SR * max_segment_ms / 1000)
+        self.pre_onset_samples = int(SR * pre_onset_ms / 1000)
+
+        # rolling pre-onset buffer (always-on, captures leading consonants)
+        self._pre_buf = collections.deque(maxlen=self.pre_onset_samples)
+        self._buf = []           # active segment audio
+        self._state = 'IDLE'
+        self._consec_speech = 0
+        self._consec_silence = 0
+        self._cooldown = 0
+        self._frame = 0
+        self._audio_offset = 0
+        self._unk_idx = (self.labels.index('_unknown_')
+                         if '_unknown_' in self.labels else None)
+        # exposed for UI compat with SlidingKWS
+        self._smooth_probs = None
+        # tracks current speech segment start time for debug output
+        self._seg_start_frame = None
+
+    @torch.no_grad()
+    def push(self, chunk: torch.Tensor):
+        """chunk: (T,) float32 PCM, typically one hop worth.
+        Returns (label, score) on trigger else (None, None)."""
+        chunk_list = chunk.tolist() if torch.is_tensor(chunk) else list(chunk)
+        self._frame += 1
+        # cheap RMS — float() forces python scalar so we don't accumulate graph state
+        ch_t = chunk if torch.is_tensor(chunk) else torch.tensor(chunk)
+        rms = float((ch_t.to(torch.float32) ** 2).mean().sqrt())
+
+        # always feed the pre-onset rolling buffer
+        self._pre_buf.extend(chunk_list)
+
+        if self._cooldown > 0:
+            self._cooldown -= 1
+            return None, None
+
+        if self._state == 'IDLE':
+            if rms > self.start_thr:
+                self._consec_speech += 1
+                if self._consec_speech >= self.speech_onset_frames:
+                    self._state = 'IN_SPEECH'
+                    self._buf = list(self._pre_buf)  # backfill leading audio
+                    self._consec_silence = 0
+                    self._seg_start_frame = self._frame
+                    if self.debug:
+                        t = self._audio_offset + self._frame * self.hop_samples / SR
+                        print(f'  [speech onset t={t:.2f}s  rms={rms:.4f}]')
+            else:
+                self._consec_speech = 0
+            return None, None
+
+        # IN_SPEECH
+        self._buf.extend(chunk_list)
+        if rms < self.stop_thr:
+            self._consec_silence += 1
+        else:
+            self._consec_silence = 0
+
+        ended_by_silence = self._consec_silence >= self.silence_hangover_frames
+        ended_by_maxlen = len(self._buf) >= self.max_segment_samples
+        if not (ended_by_silence or ended_by_maxlen):
+            return None, None
+
+        # ---- segment ended → classify
+        seg_len = min(len(self._buf), self.max_segment_samples)
+        # account for the trailing silence-hangover not being part of "real" speech
+        if ended_by_silence:
+            tail_silence_samples = self.silence_hangover_frames * self.hop_samples
+            speech_len = max(self.min_speech_samples, seg_len - tail_silence_samples)
+        else:
+            speech_len = seg_len
+
+        t_end = self._audio_offset + self._frame * self.hop_samples / SR
+        t_start = t_end - seg_len / SR
+
+        if speech_len < self.min_speech_samples:
+            if self.debug:
+                print(f'  [segment too short t={t_start:.2f}-{t_end:.2f}s '
+                      f'len={speech_len/SR:.2f}s — discarded]')
+            self._reset()
+            return None, None
+
+        wav = torch.tensor(self._buf[:seg_len], dtype=torch.float32,
+                           device=self.device).unsqueeze(0).unsqueeze(0)
+        L = torch.tensor([speech_len], device=self.device)
+        logits = self.model(wav, lengths=L).squeeze(0)
+        probs = torch.softmax(logits, dim=0)
+        self._smooth_probs = probs.detach()
+
+        unk_i = self._unk_idx
+        if unk_i is not None:
+            mask = torch.ones(len(self.labels), dtype=torch.bool, device=self.device)
+            mask[unk_i] = False
+            wake_probs = probs[mask]
+            wake_labels = [l for j, l in enumerate(self.labels) if j != unk_i]
+        else:
+            wake_probs = probs
+            wake_labels = list(self.labels)
+        best_i = int(wake_probs.argmax())
+        best_label = wake_labels[best_i]
+        score = float(wake_probs[best_i])
+
+        if self.debug:
+            prob_str = '  '.join(f'{l}:{float(probs[j]):.3f}'
+                                  for j, l in enumerate(self.labels))
+            print(f'  [segment t={t_start:.2f}-{t_end:.2f}s '
+                  f'speech_len={speech_len/SR:.2f}s] [{prob_str}]  '
+                  f'wake_best={best_label}:{score:.3f}')
+
+        triggered = score >= self.threshold
+        if triggered:
+            self._cooldown = self.cooldown_frames
+        self._reset()
+        return (best_label, score) if triggered else (None, None)
+
+    def _reset(self):
+        self._buf = []
+        self._state = 'IDLE'
+        self._consec_speech = 0
+        self._consec_silence = 0
+        self._seg_start_frame = None
+
+
 class SlidingKWS:
     """Stateful sliding-window keyword detector.
 
@@ -202,8 +362,12 @@ class SlidingKWS:
                            device=self.device).unsqueeze(0).unsqueeze(0)
 
         if self.classifier_mode:
-            # Mode 3: model is a KWSClassifier → forward returns logits (1, N)
-            logits = self.model(wav).squeeze(0)
+            # Mode 3: model is a KWSClassifier → forward returns logits (1, N).
+            # Pass the actual sample length so encoders trained in pad mode get
+            # the right mask-aware GAP; on a fixed 1s window this collapses to
+            # the legacy global GAP anyway.
+            L = torch.tensor([wav.size(-1)], device=self.device)
+            logits = self.model(wav, lengths=L).squeeze(0)
             raw = logits
         else:
             # Mode 1/2: prototype-based — embed + similarity
@@ -325,6 +489,32 @@ def main():
     parser.add_argument('--cpu', action='store_true',
                         help='Force CPU even if CUDA is available')
 
+    # detector choice — classifier mode defaults to segment (matches training)
+    parser.add_argument('--detector', choices=['auto', 'segment', 'sliding'],
+                        default='auto',
+                        help="'auto' (default) → segment in classifier_mode, "
+                             "sliding for prototype modes. Use 'sliding' to "
+                             "force the legacy fixed-window detector.")
+    # SegmentKWS energy-VAD knobs
+    parser.add_argument('--start_thr', type=float, default=0.01,
+                        help='RMS threshold to enter IN_SPEECH (default 0.01)')
+    parser.add_argument('--stop_thr', type=float, default=0.005,
+                        help='RMS threshold below which silence accumulates '
+                             '(hysteresis below start_thr; default 0.005)')
+    parser.add_argument('--speech_onset_ms', type=int, default=60,
+                        help='Sustained hop count crossing start_thr to confirm '
+                             'speech onset (default 60ms = 3 hops at 20ms)')
+    parser.add_argument('--silence_hangover_ms', type=int, default=300,
+                        help='Trailing silence to declare segment end (default 300ms)')
+    parser.add_argument('--min_speech_ms', type=int, default=200,
+                        help='Discard segments shorter than this (default 200ms)')
+    parser.add_argument('--max_segment_ms', type=int, default=3100,
+                        help='Cap segment length; matches training upper bound '
+                             '(default 3100ms = CompanyKWS P99)')
+    parser.add_argument('--pre_onset_ms', type=int, default=100,
+                        help='Backfill audio kept before onset; recovers leading '
+                             'consonants the energy gate missed (default 100ms)')
+
     args = parser.parse_args()
 
     # validate mode (mode 3 takes precedence)
@@ -362,19 +552,44 @@ def main():
     else:
         threshold = args.threshold
 
-    detector = SlidingKWS(
-        model, prototypes, labels,
-        beta=beta,
-        threshold=threshold,
-        hop_ms=args.hop_ms,
-        trigger_frames=args.trigger_frames,
-        cooldown_ms=args.cooldown_ms,
-        window_s=args.window_s,
-        ema_alpha=args.ema_alpha,
-        classifier_mode=classifier_mode,
-        device=device,
-        debug=args.debug,
-    )
+    # Resolve detector type
+    use_segment = (args.detector == 'segment' or
+                   (args.detector == 'auto' and classifier_mode))
+    if use_segment:
+        if not classifier_mode:
+            parser.error('--detector segment only supports classifier mode '
+                         '(--classifier).')
+        detector = SegmentKWS(
+            model, labels,
+            threshold=threshold,
+            hop_ms=args.hop_ms,
+            start_thr=args.start_thr,
+            stop_thr=args.stop_thr,
+            speech_onset_ms=args.speech_onset_ms,
+            silence_hangover_ms=args.silence_hangover_ms,
+            min_speech_ms=args.min_speech_ms,
+            max_segment_ms=args.max_segment_ms,
+            pre_onset_ms=args.pre_onset_ms,
+            cooldown_ms=args.cooldown_ms,
+            device=device,
+            debug=args.debug,
+        )
+        detector_kind = 'segment'
+    else:
+        detector = SlidingKWS(
+            model, prototypes, labels,
+            beta=beta,
+            threshold=threshold,
+            hop_ms=args.hop_ms,
+            trigger_frames=args.trigger_frames,
+            cooldown_ms=args.cooldown_ms,
+            window_s=args.window_s,
+            ema_alpha=args.ema_alpha,
+            classifier_mode=classifier_mode,
+            device=device,
+            debug=args.debug,
+        )
+        detector_kind = 'sliding'
 
     hop_samples = int(SR * args.hop_ms / 1000)
     wav_path = Path(args.wav)
@@ -383,16 +598,24 @@ def main():
 
     wav_info = torchaudio.info(str(wav_path))
     total_s = wav_info.num_frames / wav_info.sample_rate
-    print(f"\nStreaming '{wav_path.name}' ({total_s:.2f}s) | "
-          f"hop={args.hop_ms}ms | threshold={threshold:.4f} | "
-          f"trigger_frames={args.trigger_frames} | ema_alpha={args.ema_alpha} | "
-          f"cooldown_ms={args.cooldown_ms}\n")
+    if detector_kind == 'segment':
+        print(f"\nStreaming '{wav_path.name}' ({total_s:.2f}s) | "
+              f"detector=segment | hop={args.hop_ms}ms | threshold={threshold:.4f} | "
+              f"start_thr={args.start_thr} | stop_thr={args.stop_thr} | "
+              f"silence_hangover={args.silence_hangover_ms}ms | "
+              f"cooldown_ms={args.cooldown_ms}\n")
+    else:
+        print(f"\nStreaming '{wav_path.name}' ({total_s:.2f}s) | "
+              f"detector=sliding | hop={args.hop_ms}ms | threshold={threshold:.4f} | "
+              f"trigger_frames={args.trigger_frames} | ema_alpha={args.ema_alpha} | "
+              f"cooldown_ms={args.cooldown_ms}\n")
 
     t0 = time.perf_counter()
     n_chunks = 0
     n_triggers = 0
-    # tell detector its time offset so debug prints show real audio timestamps
-    detector._audio_offset = args.window_s
+    # tell detector its time offset so debug prints show real audio timestamps;
+    # segment detector measures from t=0, sliding from window_s
+    detector._audio_offset = 0.0 if detector_kind == 'segment' else args.window_s
 
     for chunk in stream_wav(wav_path, hop_samples):
         audio_t = n_chunks * args.hop_ms / 1000.0
