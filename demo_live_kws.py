@@ -1,13 +1,21 @@
 """
 Real-time microphone KWS demo with matplotlib (TkAgg) visualization.
 
-Streams audio from a microphone into the same SlidingKWS detector used by
-demo_sliding_kws.py, and shows a live UI:
-  - rolling waveform (last 5 s)
-  - per-class softmax probability history + threshold line + trigger marks
-  - current frame probability bars
+Uses SegmentKWS by default (matches variable-length classifier training):
+energy-VAD finds each speech segment then classifies it as a single
+variable-length input. The legacy SlidingKWS is still available via
+--detector sliding for prototype-mode ckpts.
+
+UI:
+  - rolling waveform (last 5 s), title shows live ● IN_SPEECH indicator
+  - per-class softmax probability history (step function — updates on
+    segment emit, holds value between segments)
+  - current segment probability bars
   - recent trigger log
-  - sliders for threshold / EMA alpha / trigger_frames (mutable at runtime)
+  - 3 sliders mutable at runtime:
+      * threshold
+      * stop_thr (SegmentKWS) or ema_alpha (sliding)
+      * silence_hangover_ms (SegmentKWS) or trigger_frames (sliding)
 
 Every session is dumped to <output_dir>/live_kws_<timestamp>/:
   - recording.wav   16 kHz mono int16, the raw microphone stream
@@ -18,7 +26,7 @@ Usage:
     python demo_live_kws.py --list_devices
 
     python demo_live_kws.py \
-        --classifier results/kws_classifier/best_v3_frozen.pt \
+        --classifier results/kws_classifier/best_v4_pad.pt \
         --device 1
 
 Dependencies (Windows):  pip install sounddevice
@@ -51,7 +59,7 @@ from matplotlib.animation import FuncAnimation
 from matplotlib.gridspec import GridSpec
 from matplotlib.widgets import Slider
 
-from demo_sliding_kws import SR, SlidingKWS, load_classifier
+from demo_sliding_kws import SR, SegmentKWS, SlidingKWS, load_classifier
 
 
 WINDOW_VIEW_S = 5.0
@@ -72,8 +80,9 @@ def make_run_dir(output_dir):
 
 
 class LiveKWS:
-    def __init__(self, detector, labels, device_idx, hop_ms, run_dir):
+    def __init__(self, detector, labels, device_idx, hop_ms, run_dir, detector_kind='segment'):
         self.detector = detector
+        self.detector_kind = detector_kind   # 'segment' or 'sliding'
         self.labels = list(labels)
         self.n_classes = len(self.labels)
         self.device_idx = device_idx
@@ -103,6 +112,7 @@ class LiveKWS:
         self.csv_writer = None
 
         self._t_start = None
+        self._in_speech = False   # live IN_SPEECH flag for UI indicator
 
     # ------------------------------------------------------------------ audio
     def audio_callback(self, indata, frames, time_info, status):
@@ -130,12 +140,15 @@ class LiveKWS:
             else:
                 probs = sprobs.detach().cpu().numpy().astype(np.float32)
 
+            in_speech = getattr(self.detector, '_state', None) == 'IN_SPEECH'
+
             now = time.perf_counter() - self._t_start
             self.state_q.put({
                 't': now,
                 'chunk': chunk,
                 'probs': probs,
                 'trigger': (label, float(score)) if label is not None else None,
+                'in_speech': in_speech,
             })
 
     # ------------------------------------------------------------------- ui
@@ -150,6 +163,7 @@ class LiveKWS:
             for i in range(self.n_classes):
                 self.prob_hist[i].append(float(ev['probs'][i]))
             self.time_hist.append(ev['t'])
+            self._in_speech = bool(ev.get('in_speech', False))
 
             if ev['trigger'] is not None:
                 label, score = ev['trigger']
@@ -165,9 +179,9 @@ class LiveKWS:
                       height_ratios=[1.0, 1.4, 1.2, 0.25, 0.25, 0.25],
                       hspace=0.55, wspace=0.25)
 
-        # ---- waveform
+        # ---- waveform (title doubles as a live IN_SPEECH indicator for segment mode)
         ax_wave = fig.add_subplot(gs[0, :])
-        ax_wave.set_title('Microphone waveform (last 5 s)')
+        wave_title = ax_wave.set_title('Microphone waveform (last 5 s)')
         ax_wave.set_ylim(-1, 1)
         ax_wave.set_xlim(-WINDOW_VIEW_S, 0)
         ax_wave.set_xticks([])
@@ -222,38 +236,54 @@ class LiveKWS:
 
         # ---- sliders (3 rows, each spans both columns)
         ax_thr = fig.add_subplot(gs[3, :])
-        ax_ema = fig.add_subplot(gs[4, :])
-        ax_trg = fig.add_subplot(gs[5, :])
+        ax_b   = fig.add_subplot(gs[4, :])
+        ax_c   = fig.add_subplot(gs[5, :])
         slider_thr = Slider(ax_thr, 'threshold', 0.0, 1.0,
                             valinit=self.detector.threshold, valstep=0.005)
-        slider_ema = Slider(ax_ema, 'ema_alpha', 0.05, 1.0,
-                            valinit=self.detector.ema_alpha, valstep=0.05)
-        slider_trg = Slider(ax_trg, 'trigger_frames', 1, 10,
-                            valinit=self.detector.trigger_frames, valstep=1)
 
         def on_thr(v):
             self.detector.threshold = float(v)
             thr_line.set_ydata([v, v])
             bar_thr_line.set_ydata([v, v])
-            # rebuild legend label so the threshold value stays visible
             thr_line.set_label(f'thr={v:.3f}')
             ax_prob.legend(loc='upper left', fontsize=8, ncol=self.n_classes + 1)
-
-        def on_ema(v):
-            self.detector.ema_alpha = float(v)
-
-        def on_trg(v):
-            self.detector.trigger_frames = int(v)
-
         slider_thr.on_changed(on_thr)
-        slider_ema.on_changed(on_ema)
-        slider_trg.on_changed(on_trg)
+
+        if self.detector_kind == 'segment':
+            # SegmentKWS knobs: stop_thr (energy gate floor) + silence_hangover_ms
+            slider_b = Slider(ax_b, 'stop_thr', 0.001, 0.05,
+                              valinit=self.detector.stop_thr, valstep=0.001)
+            cur_hang_ms = self.detector.silence_hangover_frames * self.hop_ms
+            slider_c = Slider(ax_c, 'silence_hangover_ms', 100, 1000,
+                              valinit=cur_hang_ms, valstep=20)
+            def on_b(v):
+                self.detector.stop_thr = float(v)
+            def on_c(v):
+                self.detector.silence_hangover_frames = max(1, int(v / self.hop_ms))
+            slider_b.on_changed(on_b)
+            slider_c.on_changed(on_c)
+        else:
+            # SlidingKWS knobs (legacy): EMA alpha + trigger frames
+            slider_b = Slider(ax_b, 'ema_alpha', 0.05, 1.0,
+                              valinit=self.detector.ema_alpha, valstep=0.05)
+            slider_c = Slider(ax_c, 'trigger_frames', 1, 10,
+                              valinit=self.detector.trigger_frames, valstep=1)
+            def on_b(v):
+                self.detector.ema_alpha = float(v)
+            def on_c(v):
+                self.detector.trigger_frames = int(v)
+            slider_b.on_changed(on_b)
+            slider_c.on_changed(on_c)
 
         # ---- animation
         def update(_):
             self.drain_state()
 
             wave_line.set_ydata(list(self.wave_buf))
+            if self.detector_kind == 'segment':
+                wave_title.set_text(
+                    'Microphone waveform (last 5 s)   '
+                    + ('● IN_SPEECH' if self._in_speech else '○ idle'))
 
             t_now = self.time_hist[-1] if self.time_hist else 0.0
             xs = np.array(self.time_hist) - t_now
@@ -284,7 +314,7 @@ class LiveKWS:
         self._anim = FuncAnimation(fig, update, interval=UI_INTERVAL_MS,
                                    blit=False, cache_frame_data=False)
         # keep slider refs alive
-        self._sliders = (slider_thr, slider_ema, slider_trg)
+        self._sliders = (slider_thr, slider_b, slider_c)
         self.fig = fig
 
     # ----------------------------------------------------------------- main
@@ -339,13 +369,32 @@ def main():
                         help='sounddevice input device index (default: system default)')
     parser.add_argument('--threshold', type=float, default=None,
                         help='Initial trigger threshold (default: thr_far05 from ckpt)')
-    parser.add_argument('--ema_alpha', type=float, default=0.3)
     parser.add_argument('--hop_ms', type=int, default=20)
-    parser.add_argument('--trigger_frames', type=int, default=3)
     parser.add_argument('--cooldown_ms', type=int, default=1000)
-    parser.add_argument('--window_s', type=float, default=1.0)
     parser.add_argument('--output_dir', default='live_kws_logs')
     parser.add_argument('--cpu', action='store_true')
+
+    # detector choice
+    parser.add_argument('--detector', choices=['segment', 'sliding'],
+                        default='segment',
+                        help='segment: energy-VAD then classify each segment '
+                             '(recommended, matches variable-length training). '
+                             'sliding: legacy fixed-window detector.')
+
+    # SegmentKWS knobs
+    parser.add_argument('--start_thr', type=float, default=0.01)
+    parser.add_argument('--stop_thr', type=float, default=0.005)
+    parser.add_argument('--speech_onset_ms', type=int, default=60)
+    parser.add_argument('--silence_hangover_ms', type=int, default=300)
+    parser.add_argument('--min_speech_ms', type=int, default=200)
+    parser.add_argument('--max_segment_ms', type=int, default=3100)
+    parser.add_argument('--pre_onset_ms', type=int, default=100)
+
+    # SlidingKWS knobs (only used with --detector sliding)
+    parser.add_argument('--ema_alpha', type=float, default=0.3)
+    parser.add_argument('--trigger_frames', type=int, default=3)
+    parser.add_argument('--window_s', type=float, default=1.0)
+
     args = parser.parse_args()
 
     if args.list_devices:
@@ -363,28 +412,54 @@ def main():
 
     run_dir = make_run_dir(args.output_dir)
 
-    detector = SlidingKWS(
-        model, None, labels,
-        beta=None,
-        threshold=threshold,
-        hop_ms=args.hop_ms,
-        trigger_frames=args.trigger_frames,
-        cooldown_ms=args.cooldown_ms,
-        window_s=args.window_s,
-        ema_alpha=args.ema_alpha,
-        classifier_mode=True,
-        device=device,
-        debug=False,
-    )
+    if args.detector == 'segment':
+        detector = SegmentKWS(
+            model, labels,
+            threshold=threshold,
+            hop_ms=args.hop_ms,
+            start_thr=args.start_thr,
+            stop_thr=args.stop_thr,
+            speech_onset_ms=args.speech_onset_ms,
+            silence_hangover_ms=args.silence_hangover_ms,
+            min_speech_ms=args.min_speech_ms,
+            max_segment_ms=args.max_segment_ms,
+            pre_onset_ms=args.pre_onset_ms,
+            cooldown_ms=args.cooldown_ms,
+            device=device,
+            debug=False,
+        )
+    else:
+        detector = SlidingKWS(
+            model, None, labels,
+            beta=None,
+            threshold=threshold,
+            hop_ms=args.hop_ms,
+            trigger_frames=args.trigger_frames,
+            cooldown_ms=args.cooldown_ms,
+            window_s=args.window_s,
+            ema_alpha=args.ema_alpha,
+            classifier_mode=True,
+            device=device,
+            debug=False,
+        )
 
+    print(f'Detector       : {args.detector}')
     print(f'Classes        : {labels}')
     print(f'Threshold      : {threshold:.4f}')
-    print(f'EMA alpha      : {args.ema_alpha}')
-    print(f'Trigger frames : {args.trigger_frames}')
+    if args.detector == 'segment':
+        print(f'start_thr      : {args.start_thr}')
+        print(f'stop_thr       : {args.stop_thr}')
+        print(f'silence_hangover_ms : {args.silence_hangover_ms}')
+        print(f'max_segment_ms : {args.max_segment_ms}')
+    else:
+        print(f'EMA alpha      : {args.ema_alpha}')
+        print(f'Trigger frames : {args.trigger_frames}')
+        print(f'window_s       : {args.window_s}')
     print(f'Cooldown ms    : {args.cooldown_ms}')
     print(f'Mic device idx : {args.device if args.device is not None else "(default)"}\n')
 
-    app = LiveKWS(detector, labels, args.device, args.hop_ms, run_dir)
+    app = LiveKWS(detector, labels, args.device, args.hop_ms, run_dir,
+                  detector_kind=args.detector)
     app.run()
 
 
