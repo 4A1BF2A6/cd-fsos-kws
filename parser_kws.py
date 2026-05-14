@@ -138,6 +138,21 @@ parser.add_argument('--speech.librispeech_samples_per_file', type=int, default=2
 parser.add_argument('--speech.librispeech_max_files', type=int, default=0,
                     help='Cap on number of LibriSpeech .flac files to use; 0 = no cap '
                          '(default: 0). Useful to control _unknown_ pool size.')
+parser.add_argument('--speech.gsc_noise_dir', type=str, default=None,
+                    help='GSC _background_noise_ dir; if set, randomly slice these '
+                         'long background recordings into variable-length _unknown_ '
+                         'negatives. E.g. <gsc>/speech_commands_v0.02/_background_noise_/')
+parser.add_argument('--speech.gsc_noise_samples_per_file', type=int, default=50,
+                    help='Random slices to extract from each GSC noise wav (default: 50). '
+                         'Each file is ~60s so 50 slices gives ~50× more diversity '
+                         'than per LibriSpeech utterance.')
+parser.add_argument('--speech.bg_duration_min_ms', type=int, default=500,
+                    help='Lower bound on random duration sampled for _unknown_ '
+                         'background / LibriSpeech / GSC-noise slices, in ms. '
+                         'Default 500 (matches wake-word P1).')
+parser.add_argument('--speech.bg_duration_max_ms', type=int, default=3100,
+                    help='Upper bound for random _unknown_ slice duration, in ms. '
+                         'Default 3100 (matches --speech.max_duration_ms / wake P99).')
 
 parser.add_argument('--speech.include_noise', action='store_true', default=True, help="one of the classes out of n should be unknown (default: False)")
 parser.add_argument('--speech.noise_snr', type=int, default=5, help='time shift the audio in milliseconds')

@@ -122,6 +122,10 @@ def build_speech_args(args):
         'librispeech_dir':  args.librispeech_dir,
         'librispeech_samples_per_file': args.librispeech_samples_per_file,
         'librispeech_max_files': args.librispeech_max_files,
+        'gsc_noise_dir':    args.gsc_noise_dir,
+        'gsc_noise_samples_per_file': args.gsc_noise_samples_per_file,
+        'bg_duration_min_ms': args.bg_duration_min_ms,
+        'bg_duration_max_ms': args.bg_duration_max_ms,
     }
 
 
@@ -259,6 +263,18 @@ def main():
                         help='Random 1s slices per utterance (default: 2)')
     parser.add_argument('--librispeech_max_files', type=int, default=0,
                         help='Cap on number of .flac files to use; 0 = no cap (default: 0)')
+    parser.add_argument('--gsc_noise_dir', default=None,
+                        help='GSC _background_noise_/ dir; if set, sliced into '
+                             'variable-length _unknown_ negatives. E.g. '
+                             '<gsc_dir>/_background_noise_/')
+    parser.add_argument('--gsc_noise_samples_per_file', type=int, default=50,
+                        help='Random slices per GSC noise wav (default: 50)')
+    parser.add_argument('--bg_duration_min_ms', type=int, default=500,
+                        help='Lower bound on random duration for _unknown_ slices '
+                             '(default 500ms, matches wake-word P1)')
+    parser.add_argument('--bg_duration_max_ms', type=int, default=3100,
+                        help='Upper bound on random duration for _unknown_ slices '
+                             '(default 3100ms, matches wake-word P99)')
     parser.add_argument('--task', default='CompanyKWS_ALL')
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--batch_size', type=int, default=128)

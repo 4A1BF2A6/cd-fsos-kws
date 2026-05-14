@@ -129,6 +129,14 @@ class CompanyKWSDataset:
         self.librispeech_dir = args.get('librispeech_dir', None)
         self.librispeech_samples_per_file = int(args.get('librispeech_samples_per_file', 2))
         self.librispeech_max_files = int(args.get('librispeech_max_files', 0))  # 0 = no cap
+        # GSC _background_noise_ injection (long noise recordings → variable slices)
+        self.gsc_noise_dir = args.get('gsc_noise_dir', None)
+        self.gsc_noise_samples_per_file = int(args.get('gsc_noise_samples_per_file', 50))
+        # Variable-length _unknown_ slice duration bounds (matches wake-word range
+        # so the model can't use input length as a free feature).
+        self.bg_duration_min_ms = int(args.get('bg_duration_min_ms', 500))
+        self.bg_duration_max_ms = int(args.get('bg_duration_max_ms', self.max_duration_ms
+                                                if 'max_duration_ms' in args else 3100))
         self.data_cache = {}
         self.data_dir = data_dir
 
@@ -367,12 +375,17 @@ class CompanyKWSDataset:
         else:
             target_len = self.desired_samples + int(self.time_shift_ms * self.sample_rate / 1000)
 
-        # Background slice path (GSC / LibriSpeech / wake-word backgrounds):
-        # always read a fixed 1s-ish chunk regardless of crop_strategy — these
-        # are the _unknown_ negatives and pretrained as ~1s.
+        # Background slice path (CompanyKWS *_background / LibriSpeech / GSC noise):
+        # honours an explicit per-entry duration so _unknown_ slices share the
+        # variable-length distribution of wake samples. Records that predate
+        # `bg_duration_seconds` fall back to the legacy fixed 1s window.
         bg_offset_s = d.pop('bg_offset_seconds', None)
         if bg_offset_s is not None:
-            bg_target_len = self.desired_samples + int(self.time_shift_ms * self.sample_rate / 1000)
+            bg_dur_s = d.pop('bg_duration_seconds', None)
+            if bg_dur_s is not None:
+                bg_target_len = int(bg_dur_s * self.sample_rate)
+            else:
+                bg_target_len = self.desired_samples + int(self.time_shift_ms * self.sample_rate / 1000)
             info = torchaudio.info(d[key_path])
             src_sr = info.sample_rate
             src_offset = int(bg_offset_s * src_sr)
@@ -434,6 +447,22 @@ class CompanyKWSDataset:
         starts = torch.arange(n_starts) * hop
         win_energy = csum[starts + max_len] - csum[starts]
         return int(starts[win_energy.argmax()].item())
+
+    def _sample_bg_slice(self, rng, file_duration_s, eof_margin=0.05):
+        """Pick (offset_s, duration_s) for a variable-length _unknown_ slice from
+        a `file_duration_s`-long source. Honours bg_duration_min/max_ms and a
+        small EOF safety margin. Returns None if the file is too short for even
+        the minimum slice.
+        """
+        max_possible = file_duration_s - eof_margin
+        lo = self.bg_duration_min_ms / 1000.0
+        if max_possible < lo:
+            return None
+        hi = min(self.bg_duration_max_ms / 1000.0, max_possible)
+        dur_s = rng.uniform(lo, hi) if hi > lo else lo
+        max_offset = max_possible - dur_s
+        offset_s = rng.uniform(0.0, max_offset) if max_offset > 0 else 0.0
+        return offset_s, dur_s
 
     def _stretch_to_target(self, sound, target_len):
         """Time-stretch waveform to exactly target_len samples.
@@ -541,13 +570,16 @@ class CompanyKWSDataset:
                     unk_count = int(math.ceil(set_size / n_wakes))
                     for _ in range(unk_count):
                         f, dur = rng_unk.choice(bg_meta)
-                        max_offset = max(0.0, dur - self.clip_duration_ms / 1000.0 - 0.1)
-                        bg_offset = rng_unk.uniform(0.0, max_offset) if max_offset > 0 else 0.0
+                        slc = self._sample_bg_slice(rng_unk, dur)
+                        if slc is None:
+                            continue
+                        bg_offset, bg_dur = slc
                         self.data_set[split].append({
                             'label': UNKNOWN_WORD_LABEL,
                             'file': f,
                             'speaker': 'background',
                             'bg_offset_seconds': bg_offset,
+                            'bg_duration_seconds': bg_dur,
                         })
 
         # silence samples
@@ -598,8 +630,7 @@ class CompanyKWSDataset:
         # Speaker-disjoint split (80/10/10): same speaker never appears in two splits,
         # otherwise the model can memorise speaker-specific cues and fake high val FAR.
         if self.unknown and self.librispeech_dir:
-            min_dur = self.clip_duration_ms / 1000.0 + 0.2
-            slice_dur = self.clip_duration_ms / 1000.0
+            min_dur = self.bg_duration_min_ms / 1000.0 + 0.2
             flac_paths = sorted(glob.glob(os.path.join(
                 self.librispeech_dir, '**', '*.flac'), recursive=True))
             if self.librispeech_max_files > 0 and len(flac_paths) > self.librispeech_max_files:
@@ -649,14 +680,17 @@ class CompanyKWSDataset:
                 if dur < min_dur:
                     n_skipped_short += 1
                     continue
-                max_offset = dur - slice_dur - 0.05
                 for _ in range(self.librispeech_samples_per_file):
-                    offset = rng_ls.uniform(0.0, max_offset)
+                    slc = self._sample_bg_slice(rng_ls, dur)
+                    if slc is None:
+                        continue
+                    offset, bg_dur = slc
                     per_split_entries[target_split].append({
                         'label': UNKNOWN_WORD_LABEL,
                         'file': f,
                         'speaker': 'librispeech_' + spk,
                         'bg_offset_seconds': offset,
+                        'bg_duration_seconds': bg_dur,
                     })
 
             for split, entries in per_split_entries.items():
@@ -671,6 +705,45 @@ class CompanyKWSDataset:
                       len(per_split_entries['validation']),
                       len(per_split_entries['testing']),
                       n_skipped_short))
+
+        # Inject GSC _background_noise_/ slices as non-speech _unknown_ negatives.
+        # Each noise wav is ~60s, so we slice many variable-length chunks per file
+        # for diversity. Speaker concept doesn't apply (synthetic / ambient sources),
+        # so we do a plain 80/10/10 random split of slice entries.
+        if self.unknown and self.gsc_noise_dir:
+            noise_wavs = sorted(glob.glob(os.path.join(self.gsc_noise_dir, '*.wav')))
+            rng_n = random.Random(RANDOM_SEED + 41)
+            noise_entries = []
+            for f in noise_wavs:
+                try:
+                    info = torchaudio.info(f)
+                    dur = info.num_frames / info.sample_rate
+                except Exception as exc:
+                    print('[CompanyKWS] GSC noise info failed {}: {}'.format(f, exc))
+                    continue
+                for _ in range(self.gsc_noise_samples_per_file):
+                    slc = self._sample_bg_slice(rng_n, dur)
+                    if slc is None:
+                        break  # file too short for even the min slice
+                    offset, bg_dur = slc
+                    noise_entries.append({
+                        'label': UNKNOWN_WORD_LABEL,
+                        'file': f,
+                        'speaker': 'gsc_noise_' + os.path.basename(f),
+                        'bg_offset_seconds': offset,
+                        'bg_duration_seconds': bg_dur,
+                    })
+            if noise_entries:
+                rng_n.shuffle(noise_entries)
+                n = len(noise_entries)
+                n_train = int(n * 0.8)
+                n_val   = int(n * 0.1)
+                self.data_set['training'].extend(noise_entries[:n_train])
+                self.data_set['validation'].extend(noise_entries[n_train:n_train + n_val])
+                self.data_set['testing'].extend(noise_entries[n_train + n_val:])
+                print('[CompanyKWS] Added {} GSC noise slices from {} files '
+                      '(train={}, val={}, test={})'.format(
+                          n, len(noise_wavs), n_train, n_val, n - n_train - n_val))
 
         # optionally absorb validation into another split (default: keep standalone)
         if self.merge_val == 'train' and self.data_set['validation']:
