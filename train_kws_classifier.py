@@ -200,8 +200,13 @@ def collect_predictions(model, loader, n_classes, unk_id, device,
     return y_score, y_pred, y_true, y_pred_close, (y_pred_ood if unk_id is not None else None)
 
 
-def evaluate(model, ds, split, batch_size, device):
-    """Compute compute_metrics() on a given split. Splits into pos (wake) and neg (_unknown_)."""
+def evaluate(model, ds, split, batch_size, device, num_workers=4, pin_memory=True):
+    """Compute compute_metrics() on a given split. Splits into pos (wake) and neg (_unknown_).
+
+    pos/neg loaders parallel-load audio in num_workers processes so validation
+    doesn't stall the GPU between epochs. Default 4 is a safe middle ground
+    (training uses 8; val/test data is smaller so 4 is usually enough).
+    """
     word_to_index = ds.word_to_index
     n_classes = len(word_to_index)
     unk_id = word_to_index.get('_unknown_')
@@ -209,10 +214,17 @@ def evaluate(model, ds, split, batch_size, device):
     pos_classes = [w for w in ds.words_list if w != '_unknown_']
     neg_classes = ['_unknown_'] if unk_id is not None else []
 
+    loader_kwargs = dict(
+        batch_size=batch_size, shuffle=False,
+        collate_fn=variable_length_collate,
+        num_workers=num_workers,
+        pin_memory=pin_memory and device.type == 'cuda',
+        persistent_workers=num_workers > 0,
+    )
+
     pos_records = ds.dataset_filter_class(ds.data_set[split], pos_classes)
     pos_loader = DataLoader(ds.get_transform_dataset(pos_records, pos_classes),
-                            batch_size=batch_size, shuffle=False,
-                            collate_fn=variable_length_collate)
+                            **loader_kwargs)
     y_score_p, y_pred_p, y_true_p, y_close_p, y_ood_p = collect_predictions(
         model, pos_loader, n_classes, unk_id, device, desc=f'{split} pos')
 
@@ -220,8 +232,7 @@ def evaluate(model, ds, split, batch_size, device):
         neg_records = ds.dataset_filter_class(ds.data_set[split], neg_classes)
         if neg_records:
             neg_loader = DataLoader(ds.get_transform_dataset(neg_records, neg_classes),
-                                    batch_size=batch_size, shuffle=False,
-                                    collate_fn=variable_length_collate)
+                                    **loader_kwargs)
             y_score_n, y_pred_n, y_true_n, y_close_n, y_ood_n = collect_predictions(
                 model, neg_loader, n_classes, unk_id, device,
                 force_unk_labels=True, desc=f'{split} neg')
@@ -353,7 +364,9 @@ def main():
             running_loss += loss.item() * x.size(0)
             n_seen += x.size(0)
 
-        val_metrics = evaluate(model, ds, 'validation', args.val_batch_size, device)
+        val_metrics = evaluate(model, ds, 'validation', args.val_batch_size, device,
+                                num_workers=args.num_workers,
+                                pin_memory=device.type == 'cuda')
         score = val_metrics['acc_far05'] if 'acc_far05' in val_metrics else val_metrics['accuracy_pos']
         print(f'[Epoch {epoch+1}] loss={running_loss/max(n_seen,1):.4f}  '
               f'val accuracy_pos={val_metrics["accuracy_pos"]:.4f}  '

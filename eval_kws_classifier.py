@@ -22,6 +22,9 @@ def main():
     parser.add_argument('--datadir', default=None,
                         help='Override CompanyKWS data dir (default: from ckpt)')
     parser.add_argument('--batch_size', type=int, default=128)
+    parser.add_argument('--num_workers', type=int, default=8,
+                        help='DataLoader worker processes for pos/neg loaders '
+                             '(default: 8). Drop to 0 only for debugging.')
     parser.add_argument('--cpu', action='store_true')
     parser.add_argument('--no_writeback', action='store_true',
                         help='Compute metrics but do not modify the checkpoint')
@@ -51,7 +54,9 @@ def main():
     model.eval()
 
     print('\nEvaluating on testing split …')
-    test_metrics = evaluate(model, ds, 'testing', args.batch_size, device)
+    test_metrics = evaluate(model, ds, 'testing', args.batch_size, device,
+                             num_workers=args.num_workers,
+                             pin_memory=device.type == 'cuda')
 
     print('\n=== Test metrics ===')
     print(json.dumps({k: float(v) for k, v in test_metrics.items()
