@@ -22,7 +22,6 @@ Usage (mode 3 — recommended):
 """
 
 import argparse
-import collections
 import time
 from pathlib import Path
 
@@ -332,7 +331,9 @@ class SlidingKWS:
         self.device = device
         self.hop = int(SR * hop_ms / 1000)
         self.window = int(SR * window_s)
-        self.buf = collections.deque(maxlen=self.window)
+        self._buf = np.zeros(self.window, dtype=np.float32)
+        self._write_pos = 0
+        self._buf_filled = 0
         self.trigger_frames = trigger_frames
         self.cooldown_frames = int(cooldown_ms / hop_ms)  # frames to suppress after trigger
         self.ema_alpha = ema_alpha       # 1.0 = no smoothing; 0.3 = strong smoothing
@@ -351,14 +352,25 @@ class SlidingKWS:
     @torch.no_grad()
     def push(self, chunk: torch.Tensor):
         """chunk: (T,) float32 PCM.  Returns (label, score) or (None, None)."""
-        self.buf.extend(chunk.tolist())
-        self._pending += len(chunk)
+        chunk_np = np.asarray(chunk.tolist(), dtype=np.float32)
+        n = len(chunk_np)
+        end = self._write_pos + n
+        if end <= self.window:
+            self._buf[self._write_pos:end] = chunk_np
+        else:
+            split = self.window - self._write_pos
+            self._buf[self._write_pos:] = chunk_np[:split]
+            self._buf[:n - split] = chunk_np[split:]
+        self._write_pos = (self._write_pos + n) % self.window
+        self._buf_filled = min(self._buf_filled + n, self.window)
+        self._pending += n
 
-        if len(self.buf) < self.window or self._pending < self.hop:
+        if self._buf_filled < self.window or self._pending < self.hop:
             return None, None
         self._pending = 0
 
-        wav = torch.tensor(list(self.buf), dtype=torch.float32,
+        ordered = np.roll(self._buf, -self._write_pos)
+        wav = torch.tensor(ordered.tolist(), dtype=torch.float32,
                            device=self.device).unsqueeze(0).unsqueeze(0)
 
         if self.classifier_mode:

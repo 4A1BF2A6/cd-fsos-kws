@@ -63,13 +63,38 @@ from demo_sliding_kws import SR, SegmentKWS, SlidingKWS, load_classifier
 
 
 WINDOW_VIEW_S = 5.0
-WAVE_DOWNSAMPLE = 16  # display waveform at 1 kHz (16 kHz / 16)
 UI_INTERVAL_MS = 100  # matplotlib redraw period
 
 
 def list_input_devices():
     print(sd.query_devices())
     print('\nUse --device <index> to select one of the input-capable rows above.')
+
+
+def describe_input_device(device_idx):
+    info = sd.query_devices(device_idx, 'input')
+    hostapi = sd.query_hostapis(info['hostapi'])['name']
+    return '{} {}, {} in'.format(info['name'], hostapi, info['max_input_channels'])
+
+
+def validate_input_channel(device_idx, stream_channels, input_channel, parser):
+    if input_channel >= stream_channels:
+        parser.error('--channel {} is outside the opened stream width {}. '
+                     'Use --stream_channels at least {}.'
+                     .format(input_channel, stream_channels, input_channel + 1))
+
+    info = sd.query_devices(device_idx, 'input')
+    max_channels = int(info['max_input_channels'])
+    if stream_channels > max_channels:
+        hostapi = sd.query_hostapis(info['hostapi'])['name']
+        parser.error(
+            '--stream_channels {} requested, but device {} '
+            '({} / {}) exposes only {}. Run --list_devices and choose a device '
+            'that shows 7 in, e.g. the EMEET WASAPI or WDM-KS entry.'
+            .format(stream_channels, device_idx, info['name'],
+                    hostapi, max_channels)
+        )
+    return info
 
 
 def make_run_dir(output_dir):
@@ -80,12 +105,15 @@ def make_run_dir(output_dir):
 
 
 class LiveKWS:
-    def __init__(self, detector, labels, device_idx, hop_ms, run_dir, detector_kind='segment'):
+    def __init__(self, detector, labels, device_idx, stream_channels,
+                 input_channel, hop_ms, run_dir, detector_kind='segment'):
         self.detector = detector
         self.detector_kind = detector_kind   # 'segment' or 'sliding'
         self.labels = list(labels)
         self.n_classes = len(self.labels)
         self.device_idx = device_idx
+        self.stream_channels = stream_channels
+        self.input_channel = input_channel
         self.hop_ms = hop_ms
         self.hop_samples = int(SR * hop_ms / 1000)
         self.run_dir = run_dir
@@ -95,16 +123,13 @@ class LiveKWS:
         self.stop_flag = threading.Event()
 
         # display buffers
-        n_wave = int(WINDOW_VIEW_S * SR / WAVE_DOWNSAMPLE)
-        self.wave_buf = deque([0.0] * n_wave, maxlen=n_wave)
-
         n_prob = int(WINDOW_VIEW_S * 1000 / hop_ms)
         self.prob_hist = [deque([1.0 / self.n_classes] * n_prob, maxlen=n_prob)
                           for _ in self.labels]
         self.time_hist = deque([0.0] * n_prob, maxlen=n_prob)
 
-        # full trigger history (for plotting old marks); also written to csv
-        self.trigger_log = []
+        # trigger history for plotting and log text; bounded to prevent unbounded growth
+        self.trigger_log = deque(maxlen=1000)
 
         # output writers — opened in run()
         self.wav_writer = None
@@ -118,7 +143,7 @@ class LiveKWS:
     def audio_callback(self, indata, frames, time_info, status):
         if status:
             print('Audio status:', status, file=sys.stderr)
-        self.audio_q.put(indata[:, 0].copy())
+        self.audio_q.put(indata[:, self.input_channel].copy())
 
     def inference_loop(self):
         while not self.stop_flag.is_set():
@@ -132,20 +157,22 @@ class LiveKWS:
                 ints = (np.clip(chunk, -1.0, 1.0) * 32767).astype(np.int16)
                 self.wav_writer.writeframes(ints.tobytes())
 
-            label, score = self.detector.push(torch.from_numpy(chunk))
+            # torch.from_numpy()/Tensor.numpy() fail in some old torch + newer
+            # Python environments when NumPy's C API cannot be initialized.
+            chunk_tensor = torch.tensor(chunk.tolist(), dtype=torch.float32)
+            label, score = self.detector.push(chunk_tensor)
 
             sprobs = self.detector._smooth_probs
             if sprobs is None:
                 probs = np.full(self.n_classes, 1.0 / self.n_classes, dtype=np.float32)
             else:
-                probs = sprobs.detach().cpu().numpy().astype(np.float32)
+                probs = np.asarray(sprobs.detach().cpu().tolist(), dtype=np.float32)
 
             in_speech = getattr(self.detector, '_state', None) == 'IN_SPEECH'
 
             now = time.perf_counter() - self._t_start
             self.state_q.put({
                 't': now,
-                'chunk': chunk,
                 'probs': probs,
                 'trigger': (label, float(score)) if label is not None else None,
                 'in_speech': in_speech,
@@ -159,7 +186,6 @@ class LiveKWS:
             except queue.Empty:
                 break
 
-            self.wave_buf.extend(ev['chunk'][::WAVE_DOWNSAMPLE].tolist())
             for i in range(self.n_classes):
                 self.prob_hist[i].append(float(ev['probs'][i]))
             self.time_hist.append(ev['t'])
@@ -174,9 +200,9 @@ class LiveKWS:
                 print(f'  [TRIGGER] t={ev["t"]:.3f}s  label={label}  score={score:.4f}')
 
     def _build_ui(self):
-        fig = plt.figure(figsize=(13, 9))
-        gs = GridSpec(6, 2, figure=fig,
-                      height_ratios=[1.0, 1.4, 1.2, 0.25, 0.25, 0.25],
+        fig = plt.figure(figsize=(13, 7.5))
+        gs = GridSpec(5, 2, figure=fig,
+                      height_ratios=[1.6, 1.2, 0.25, 0.25, 0.25],
                       hspace=0.55, wspace=0.25)
 
         # ---- waveform (title doubles as a live IN_SPEECH indicator for segment mode)
@@ -189,7 +215,7 @@ class LiveKWS:
         wave_line, = ax_wave.plot(wave_x, list(self.wave_buf), lw=0.5, color='#444')
 
         # ---- probability history
-        ax_prob = fig.add_subplot(gs[1, :])
+        ax_prob = fig.add_subplot(gs[0, :])
         ax_prob.set_title('Smoothed softmax probability')
         ax_prob.set_ylim(0, 1.05)
         ax_prob.set_xlim(-WINDOW_VIEW_S, 0)
@@ -218,7 +244,7 @@ class LiveKWS:
                                        zorder=5, edgecolors='black', linewidths=0.5)
 
         # ---- current bars
-        ax_bar = fig.add_subplot(gs[2, 0])
+        ax_bar = fig.add_subplot(gs[1, 0])
         ax_bar.set_title('Current frame probabilities')
         ax_bar.set_ylim(0, 1)
         bars = ax_bar.bar(self.labels, [0] * self.n_classes, color=colors)
@@ -228,16 +254,16 @@ class LiveKWS:
             tick.set_rotation(15)
 
         # ---- trigger log text
-        ax_log = fig.add_subplot(gs[2, 1])
+        ax_log = fig.add_subplot(gs[1, 1])
         ax_log.set_title('Recent triggers')
         ax_log.axis('off')
         log_txt = ax_log.text(0.0, 1.0, '(none yet)', va='top', ha='left',
                               family='monospace', fontsize=10)
 
         # ---- sliders (3 rows, each spans both columns)
-        ax_thr = fig.add_subplot(gs[3, :])
-        ax_b   = fig.add_subplot(gs[4, :])
-        ax_c   = fig.add_subplot(gs[5, :])
+        ax_thr = fig.add_subplot(gs[2, :])
+        ax_ema = fig.add_subplot(gs[3, :])
+        ax_trg = fig.add_subplot(gs[4, :])
         slider_thr = Slider(ax_thr, 'threshold', 0.0, 1.0,
                             valinit=self.detector.threshold, valstep=0.005)
 
@@ -294,7 +320,7 @@ class LiveKWS:
                 b.set_height(self.prob_hist[i][-1])
 
             if self.trigger_log:
-                tail = self.trigger_log[-10:]
+                tail = list(self.trigger_log)[-10:]
                 log_txt.set_text('\n'.join(
                     f'{t:7.2f}s  {label:<12}  {score:.3f}'
                     for t, label, score in tail))
@@ -309,7 +335,7 @@ class LiveKWS:
             else:
                 trig_scatter.set_offsets(np.empty((0, 2)))
 
-            return (wave_line, *prob_lines, *bars, log_txt, trig_scatter)
+            return (*prob_lines, *bars, log_txt, trig_scatter)
 
         self._anim = FuncAnimation(fig, update, interval=UI_INTERVAL_MS,
                                    blit=False, cache_frame_data=False)
@@ -338,7 +364,7 @@ class LiveKWS:
         self._t_start = time.perf_counter()
         stream = sd.InputStream(
             samplerate=SR,
-            channels=1,
+            channels=self.stream_channels,
             dtype='float32',
             blocksize=self.hop_samples,
             device=self.device_idx,
@@ -367,6 +393,12 @@ def main():
                         help='KWSClassifier checkpoint from train_kws_classifier.py')
     parser.add_argument('--device', type=int, default=None,
                         help='sounddevice input device index (default: system default)')
+    parser.add_argument('--input_channel', '--channel', type=int, default=0,
+                        help='0-based input channel to use from the selected device '
+                             '(default: 0; use 6 for ch07)')
+    parser.add_argument('--stream_channels', type=int, default=7,
+                        help='number of input channels to open from the device '
+                             '(default: 7)')
     parser.add_argument('--threshold', type=float, default=None,
                         help='Initial trigger threshold (default: thr_far05 from ckpt)')
     parser.add_argument('--hop_ms', type=int, default=20)
@@ -402,6 +434,11 @@ def main():
         return
     if not args.classifier:
         parser.error('--classifier is required (or use --list_devices)')
+    if args.input_channel < 0:
+        parser.error('--input_channel must be >= 0')
+    if args.stream_channels <= 0:
+        parser.error('--stream_channels must be > 0')
+    validate_input_channel(args.device, args.stream_channels, args.input_channel, parser)
 
     device = torch.device('cpu' if args.cpu or not torch.cuda.is_available() else 'cuda')
     print(f'Torch device: {device}')
@@ -456,9 +493,13 @@ def main():
         print(f'Trigger frames : {args.trigger_frames}')
         print(f'window_s       : {args.window_s}')
     print(f'Cooldown ms    : {args.cooldown_ms}')
-    print(f'Mic device idx : {args.device if args.device is not None else "(default)"}\n')
+    print(f'Mic device idx : {args.device if args.device is not None else "(default)"}')
+    print(f'Mic device     : {describe_input_device(args.device)}')
+    print(f'Stream channels: {args.stream_channels}')
+    print(f'Input channel  : {args.input_channel} (0-based, ch{args.input_channel + 1:02d})\n')
 
-    app = LiveKWS(detector, labels, args.device, args.hop_ms, run_dir,
+    app = LiveKWS(detector, labels, args.device, args.stream_channels,
+                  args.input_channel, args.hop_ms, run_dir,
                   detector_kind=args.detector)
     app.run()
 

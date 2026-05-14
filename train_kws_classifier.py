@@ -20,7 +20,6 @@ from tqdm import tqdm
 # noqa: F401 — registers model builders
 import models
 from data.CompanyKWS import CompanyKWSDataset, variable_length_collate
-from metrics import compute_metrics
 
 
 DSCNNL_EMB_DIM = 276    # DSCNNL_LAYERNORM output dim
@@ -207,6 +206,8 @@ def evaluate(model, ds, split, batch_size, device, num_workers=4, pin_memory=Tru
     doesn't stall the GPU between epochs. Default 4 is a safe middle ground
     (training uses 8; val/test data is smaller so 4 is usually enough).
     """
+    from metrics import compute_metrics
+
     word_to_index = ds.word_to_index
     n_classes = len(word_to_index)
     unk_id = word_to_index.get('_unknown_')
