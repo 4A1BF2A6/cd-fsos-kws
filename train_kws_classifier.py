@@ -344,7 +344,21 @@ def main():
 
     os.makedirs(os.path.dirname(args.out) or '.', exist_ok=True)
 
-    best_score = -1.0
+    def _selection_key(m):
+        """Lexicographic preference for best-epoch selection:
+            1) higher acc_far05
+            2) higher aucROC
+            3) higher accuracy_neg
+        accuracy_pos isn't needed as a tiebreaker — it's already baked into
+        acc_far05 (which is (TPR_at_FAR05 + TNR_at_FAR05) / 2).
+        """
+        return (
+            m.get('acc_far05', m.get('accuracy_pos', 0.0)),
+            m.get('aucROC', 0.0),
+            m.get('accuracy_neg', 0.0),
+        )
+
+    best_key = (-1.0, -1.0, -1.0)
     best_metrics = None
     for epoch in range(args.epochs):
         model.train()
@@ -367,7 +381,7 @@ def main():
         val_metrics = evaluate(model, ds, 'validation', args.val_batch_size, device,
                                 num_workers=args.num_workers,
                                 pin_memory=device.type == 'cuda')
-        score = val_metrics['acc_far05'] if 'acc_far05' in val_metrics else val_metrics['accuracy_pos']
+        key = _selection_key(val_metrics)
         print(f'[Epoch {epoch+1}] loss={running_loss/max(n_seen,1):.4f}  '
               f'val accuracy_pos={val_metrics["accuracy_pos"]:.4f}  '
               f'accuracy_neg={val_metrics["accuracy_neg"]:.4f}  '
@@ -375,8 +389,8 @@ def main():
               f'thr_far05={val_metrics["thr_far05"]:.4f}  '
               f'aucROC={val_metrics["aucROC"]:.4f}')
 
-        if score > best_score:
-            best_score = score
+        if key > best_key:
+            best_key = key
             best_metrics = val_metrics
             torch.save({
                 'state_dict':       model.state_dict(),
