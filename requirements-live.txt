@@ -1,0 +1,9 @@
+# Minimal runtime dependencies for demo_live_kws.py / demo_sliding_kws.py.
+#
+# Use Python 3.7-3.10. The original project pins torch==1.13.1 and
+# torchaudio==0.13.1, which do not support Python 3.14.
+numpy==1.21.5
+torch==1.13.1
+torchaudio==0.13.1
+matplotlib==3.5.3
+sounddevice==0.4.6

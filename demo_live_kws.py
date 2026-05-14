@@ -1,21 +1,18 @@
 """
 Real-time microphone KWS demo with matplotlib (TkAgg) visualization.
 
-Uses SegmentKWS by default (matches variable-length classifier training):
-energy-VAD finds each speech segment then classifies it as a single
-variable-length input. The legacy SlidingKWS is still available via
---detector sliding for prototype-mode ckpts.
+Uses SlidingKWS by default: all microphone audio is continuously fed into a
+fixed rolling window and classified every hop. SegmentKWS is still available
+via --detector segment if you want energy-VAD segmenting later.
 
 UI:
-  - rolling waveform (last 5 s), title shows live ● IN_SPEECH indicator
-  - per-class softmax probability history (step function — updates on
-    segment emit, holds value between segments)
-  - current segment probability bars
+  - per-class softmax probability history
+  - current probability bars
   - recent trigger log
   - 3 sliders mutable at runtime:
       * threshold
-      * stop_thr (SegmentKWS) or ema_alpha (sliding)
-      * silence_hangover_ms (SegmentKWS) or trigger_frames (sliding)
+      * ema_alpha (sliding) or stop_thr (SegmentKWS)
+      * trigger_frames (sliding) or silence_hangover_ms (SegmentKWS)
 
 Every session is dumped to <output_dir>/live_kws_<timestamp>/:
   - recording.wav   16 kHz mono int16, the raw microphone stream
@@ -205,18 +202,9 @@ class LiveKWS:
                       height_ratios=[1.6, 1.2, 0.25, 0.25, 0.25],
                       hspace=0.55, wspace=0.25)
 
-        # ---- waveform (title doubles as a live IN_SPEECH indicator for segment mode)
-        ax_wave = fig.add_subplot(gs[0, :])
-        wave_title = ax_wave.set_title('Microphone waveform (last 5 s)')
-        ax_wave.set_ylim(-1, 1)
-        ax_wave.set_xlim(-WINDOW_VIEW_S, 0)
-        ax_wave.set_xticks([])
-        wave_x = np.linspace(-WINDOW_VIEW_S, 0, len(self.wave_buf))
-        wave_line, = ax_wave.plot(wave_x, list(self.wave_buf), lw=0.5, color='#444')
-
         # ---- probability history
         ax_prob = fig.add_subplot(gs[0, :])
-        ax_prob.set_title('Smoothed softmax probability')
+        prob_title = ax_prob.set_title('Smoothed softmax probability')
         ax_prob.set_ylim(0, 1.05)
         ax_prob.set_xlim(-WINDOW_VIEW_S, 0)
         ax_prob.set_xlabel('time (s, relative to now)')
@@ -262,8 +250,8 @@ class LiveKWS:
 
         # ---- sliders (3 rows, each spans both columns)
         ax_thr = fig.add_subplot(gs[2, :])
-        ax_ema = fig.add_subplot(gs[3, :])
-        ax_trg = fig.add_subplot(gs[4, :])
+        ax_b = fig.add_subplot(gs[3, :])
+        ax_c = fig.add_subplot(gs[4, :])
         slider_thr = Slider(ax_thr, 'threshold', 0.0, 1.0,
                             valinit=self.detector.threshold, valstep=0.005)
 
@@ -305,10 +293,9 @@ class LiveKWS:
         def update(_):
             self.drain_state()
 
-            wave_line.set_ydata(list(self.wave_buf))
             if self.detector_kind == 'segment':
-                wave_title.set_text(
-                    'Microphone waveform (last 5 s)   '
+                prob_title.set_text(
+                    'Smoothed softmax probability   '
                     + ('● IN_SPEECH' if self._in_speech else '○ idle'))
 
             t_now = self.time_hist[-1] if self.time_hist else 0.0
@@ -393,9 +380,9 @@ def main():
                         help='KWSClassifier checkpoint from train_kws_classifier.py')
     parser.add_argument('--device', type=int, default=None,
                         help='sounddevice input device index (default: system default)')
-    parser.add_argument('--input_channel', '--channel', type=int, default=0,
+    parser.add_argument('--input_channel', '--channel', type=int, default=6,
                         help='0-based input channel to use from the selected device '
-                             '(default: 0; use 6 for ch07)')
+                             '(default: 6, ch07)')
     parser.add_argument('--stream_channels', type=int, default=7,
                         help='number of input channels to open from the device '
                              '(default: 7)')
@@ -407,11 +394,11 @@ def main():
     parser.add_argument('--cpu', action='store_true')
 
     # detector choice
-    parser.add_argument('--detector', choices=['segment', 'sliding'],
-                        default='segment',
-                        help='segment: energy-VAD then classify each segment '
-                             '(recommended, matches variable-length training). '
-                             'sliding: legacy fixed-window detector.')
+    parser.add_argument('--detector', choices=['sliding', 'segment'],
+                        default='sliding',
+                        help='sliding: no VAD, continuously classify a rolling '
+                             'fixed window. segment: energy-VAD then classify '
+                             'each detected speech segment.')
 
     # SegmentKWS knobs
     parser.add_argument('--start_thr', type=float, default=0.01)
