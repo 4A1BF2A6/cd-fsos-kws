@@ -250,7 +250,53 @@ dry-run 验证：
 
 ## 建议的训练接入方案
 
-第一阶段建议不改模型结构，只改训练数据。
+第一阶段已按“不改模型结构，只改训练数据”的方式接入 `train_kws_classifier.py`。
+
+新增训练参数：
+
+```text
+--hard_negative_dir
+--hard_negative_category_weights
+```
+
+`--hard_negative_dir` 指向本脚本生成的输出根目录。训练脚本会读取：
+
+```text
+<hard_negative_dir>/manifests/train.csv
+<hard_negative_dir>/manifests/val.csv
+<hard_negative_dir>/manifests/test.csv
+```
+
+并把其中 wav 作为 `_unknown_` 加入 CompanyKWS 的 training / validation / testing split。
+
+采样是两层权重：
+
+1. `_unknown_` 内先按 source 采样，例如 `gsc_words`、`gsc_noise`、`librispeech`、`hard_negative`
+2. `hard_negative` source 内再按 manifest 的 `category` 采样
+
+默认 `--hard_negative_category_weights` 为空，表示 active hard negative category 等权采样。因此即使正式数据里：
+
+```text
+hey_phoneme_similar       1000
+camy_phoneme_similar       308
+reco_phoneme_similar        99
+local_phoneme_confuser      89
+```
+
+训练采样时四个 active category 默认仍然各占 hard negative source 的 25%。
+
+推荐训练参数：
+
+```bash
+--hard_negative_dir /mnt/vdb1/logic/kws_hard_negative/librispeech_phoneme_hardneg_v1 \
+--unknown_source_weights company_background=0.15,gsc_noise=0.20,gsc_words=0.30,silence=0.10,librispeech=0.25,hard_negative=0.25
+```
+
+如果要重点修复 `hey / hi` 误唤醒，可以显式提高 `hey_phoneme_similar`：
+
+```bash
+--hard_negative_category_weights hey_phoneme_similar=0.5,camy_phoneme_similar=0.2,reco_phoneme_similar=0.15,local_phoneme_confuser=0.15
+```
 
 ### 方案 A：直接混入 unknown
 

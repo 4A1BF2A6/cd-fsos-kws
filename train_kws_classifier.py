@@ -150,6 +150,7 @@ def build_speech_args(args):
         'librispeech_max_files': args.librispeech_max_files,
         'gsc_noise_dir':    args.gsc_noise_dir,
         'gsc_noise_samples_per_file': args.gsc_noise_samples_per_file,
+        'hard_negative_dir': args.hard_negative_dir,
         'bg_duration_min_ms': args.bg_duration_min_ms,
         'bg_duration_max_ms': args.bg_duration_max_ms,
     }
@@ -164,7 +165,12 @@ def unknown_source(record):
     """
     if record.get('is_silence', False):
         return 'silence'
+    explicit_source = record.get('unknown_source')
+    if explicit_source:
+        return explicit_source
     speaker = str(record.get('speaker', ''))
+    if speaker.startswith('hard_negative_'):
+        return 'hard_negative'
     if speaker == 'gsc_unknown':
         return 'gsc_words'
     if speaker.startswith('librispeech_'):
@@ -183,6 +189,7 @@ def parse_unknown_source_weights(text):
         'gsc_words': 0.25,
         'silence': 0.10,
         'librispeech': 0.10,
+        'hard_negative': 0.25,
         'unknown_other': 0.10,
     }
     if not text:
@@ -200,19 +207,45 @@ def parse_unknown_source_weights(text):
     return out
 
 
+def parse_hard_negative_category_weights(text):
+    """Parse hard-negative category sampling weights.
+
+    Empty text means equal weight across active manifest categories.
+    """
+    if not text:
+        return {}
+    out = {}
+    for item in text.split(','):
+        item = item.strip()
+        if not item:
+            continue
+        if '=' not in item:
+            raise ValueError(
+                '--hard_negative_category_weights entries must be name=value, got {}'.format(item))
+        name, value = item.split('=', 1)
+        out[name.strip()] = float(value)
+    return out
+
+
 def build_sample_weights(records, word_to_index, unknown_source_weights=None,
+                         hard_negative_category_weights=None,
                          samples_per_class_per_epoch=0):
     """Balance wake classes and stratify _unknown_ by source bucket."""
     n_classes = len(word_to_index)
     counts = [0] * n_classes
     unknown_label = '_unknown_'
     source_counts = {}
+    hardneg_category_counts = {}
     unknown_source_weights = unknown_source_weights or parse_unknown_source_weights(None)
+    hard_negative_category_weights = hard_negative_category_weights or {}
     for r in records:
         counts[word_to_index[r['label']]] += 1
         if r['label'] == unknown_label:
             src = unknown_source(r)
             source_counts[src] = source_counts.get(src, 0) + 1
+            if src == 'hard_negative':
+                cat = r.get('hardneg_category', 'unknown_hard_negative')
+                hardneg_category_counts[cat] = hardneg_category_counts.get(cat, 0) + 1
 
     active_source_weights = {
         src: unknown_source_weights.get(src, unknown_source_weights.get('unknown_other', 0.0))
@@ -228,7 +261,20 @@ def build_sample_weights(records, word_to_index, unknown_source_weights=None,
         if r['label'] == unknown_label and source_counts:
             src = unknown_source(r)
             src_weight = max(0.0, active_source_weights.get(src, 0.0)) / total_source_weight
-            weights.append(src_weight / source_counts[src])
+            if src == 'hard_negative' and hardneg_category_counts:
+                cat = r.get('hardneg_category', 'unknown_hard_negative')
+                active_cat_weights = {
+                    active_cat: hard_negative_category_weights.get(active_cat, 1.0)
+                    for active_cat in hardneg_category_counts
+                }
+                total_cat_weight = sum(w for w in active_cat_weights.values() if w > 0)
+                if total_cat_weight <= 0:
+                    raise ValueError('All active hard-negative category weights are <= 0: {}'.format(
+                        active_cat_weights))
+                cat_weight = max(0.0, active_cat_weights.get(cat, 0.0)) / total_cat_weight
+                weights.append(src_weight * cat_weight / hardneg_category_counts[cat])
+            else:
+                weights.append(src_weight / source_counts[src])
         else:
             weights.append(1.0 / counts[word_to_index[r['label']]])
     if samples_per_class_per_epoch and samples_per_class_per_epoch > 0:
@@ -244,15 +290,28 @@ def build_sample_weights(records, word_to_index, unknown_source_weights=None,
             k: round(max(0.0, v) / total_source_weight, 4)
             for k, v in sorted(active_source_weights.items())
         })
+    if hardneg_category_counts:
+        active_cat_weights = {
+            cat: hard_negative_category_weights.get(cat, 1.0)
+            for cat in hardneg_category_counts
+        }
+        total_cat_weight = sum(w for w in active_cat_weights.values() if w > 0)
+        print('  hard-negative category counts:', dict(sorted(hardneg_category_counts.items())))
+        print('  hard-negative category sampling weights:', {
+            k: round(max(0.0, v) / total_cat_weight, 4)
+            for k, v in sorted(active_cat_weights.items())
+        })
     print('  samples per epoch:', num_samples)
     return weights, num_samples
 
 
 def make_weighted_sampler(records, word_to_index, unknown_source_weights=None,
+                          hard_negative_category_weights=None,
                           samples_per_class_per_epoch=0):
     weights, num_samples = build_sample_weights(
         records, word_to_index,
         unknown_source_weights=unknown_source_weights,
+        hard_negative_category_weights=hard_negative_category_weights,
         samples_per_class_per_epoch=samples_per_class_per_epoch)
     return WeightedRandomSampler(weights, num_samples=num_samples, replacement=True)
 
@@ -302,6 +361,7 @@ class WeightedLengthBucketBatchSampler:
 
 def get_iid_dataloader_balanced(ds, split, batch_size, num_workers=4, pin_memory=True,
                                 unknown_source_weights=None,
+                                hard_negative_category_weights=None,
                                 samples_per_class_per_epoch=0,
                                 length_bucket_ms=500):
     """Like ds.get_iid_dataloader but with WeightedRandomSampler for balance.
@@ -315,6 +375,7 @@ def get_iid_dataloader_balanced(ds, split, batch_size, num_workers=4, pin_memory
     weights, num_samples = build_sample_weights(
         records, ds.word_to_index,
         unknown_source_weights=unknown_source_weights,
+        hard_negative_category_weights=hard_negative_category_weights,
         samples_per_class_per_epoch=samples_per_class_per_epoch)
     if length_bucket_ms and length_bucket_ms > 0:
         bucket_samples = max(1, int(ds.sample_rate * length_bucket_ms / 1000))
@@ -584,6 +645,10 @@ def main():
                              '<gsc_dir>/_background_noise_/')
     parser.add_argument('--gsc_noise_samples_per_file', type=int, default=50,
                         help='Random slices per GSC noise wav (default: 50)')
+    parser.add_argument('--hard_negative_dir', default=None,
+                        help='Root produced by tools/build_librispeech_phoneme_hardneg.py. '
+                             'Reads manifests/{train,val,test}.csv and adds wavs as '
+                             '_unknown_ hard negatives.')
     parser.add_argument('--bg_duration_min_ms', type=int, default=500,
                         help='Lower bound on random duration for _unknown_ slices '
                              '(default 500ms, matches wake-word P1)')
@@ -603,11 +668,17 @@ def main():
     parser.add_argument('--head_dropout', type=float, default=0.4,
                         help='Dropout for --head mlp. Default: 0.3.')
     parser.add_argument('--unknown_source_weights', type=str,
-                        default='company_background=0.15,gsc_noise=0.20,gsc_words=0.30,silence=0.10,librispeech=0.25',
+                        default='company_background=0.15,gsc_noise=0.20,gsc_words=0.30,silence=0.10,librispeech=0.25,hard_negative=0.25',
                         help='Comma-separated sampling weights inside _unknown_. '
                              'Active sources are renormalized. Default: '
                              'company_background=0.15,gsc_noise=0.20,'
-                             'gsc_words=0.30,silence=0.10,librispeech=0.25')
+                             'gsc_words=0.30,silence=0.10,librispeech=0.25,'
+                             'hard_negative=0.25')
+    parser.add_argument('--hard_negative_category_weights', type=str, default='',
+                        help='Comma-separated sampling weights inside hard_negative, '
+                             'e.g. hey_phoneme_similar=0.4,camy_phoneme_similar=0.25,'
+                             'reco_phoneme_similar=0.2,local_phoneme_confuser=0.15. '
+                             'Empty means equal weight across active categories.')
     parser.add_argument('--samples_per_class_per_epoch', type=int, default=0,
                         help='If >0, each epoch samples this many examples per '
                              'top-level class according to the weighted sampler. '
@@ -702,6 +773,9 @@ def main():
                                                 pin_memory=device.type == 'cuda',
                                                 unknown_source_weights=parse_unknown_source_weights(
                                                     args.unknown_source_weights),
+                                                hard_negative_category_weights=(
+                                                    parse_hard_negative_category_weights(
+                                                        args.hard_negative_category_weights)),
                                                 samples_per_class_per_epoch=(
                                                     args.samples_per_class_per_epoch),
                                                 length_bucket_ms=args.length_bucket_ms)
@@ -798,6 +872,8 @@ def main():
                 'head_hidden':      args.head_hidden,
                 'head_dropout':     args.head_dropout,
                 'unknown_source_weights': args.unknown_source_weights,
+                'hard_negative_dir': args.hard_negative_dir,
+                'hard_negative_category_weights': args.hard_negative_category_weights,
                 'samples_per_class_per_epoch': args.samples_per_class_per_epoch,
                 'length_bucket_ms': args.length_bucket_ms,
                 'sliding_window_ms': args.sliding_window_ms,
