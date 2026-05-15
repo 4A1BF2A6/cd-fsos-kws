@@ -52,7 +52,29 @@ def variable_length_collate(batch):
     for i, b in enumerate(batch):
         T_i = b['data'].size(-1)
         data[i, :, :T_i] = b['data']
-    out = default_collate([{k: v for k, v in b.items() if k != 'data'} for b in batch])
+
+    meta_keys = sorted({k for b in batch for k in b.keys() if k != 'data'})
+    defaults = {}
+    for key in meta_keys:
+        value = next((b[key] for b in batch if key in b), '')
+        if torch.is_tensor(value):
+            defaults[key] = torch.zeros_like(value)
+        elif isinstance(value, bool):
+            defaults[key] = False
+        elif isinstance(value, int):
+            defaults[key] = 0
+        elif isinstance(value, float):
+            defaults[key] = 0.0
+        else:
+            defaults[key] = ''
+
+    normalized = []
+    for b in batch:
+        item = {}
+        for key in meta_keys:
+            item[key] = b.get(key, defaults[key])
+        normalized.append(item)
+    out = default_collate(normalized)
     out['data'] = data
     out['lengths'] = lengths
     return out
