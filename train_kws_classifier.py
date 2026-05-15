@@ -645,7 +645,8 @@ def main():
                              '<gsc_dir>/_background_noise_/')
     parser.add_argument('--gsc_noise_samples_per_file', type=int, default=50,
                         help='Random slices per GSC noise wav (default: 50)')
-    parser.add_argument('--hard_negative_dir', default=None,
+    parser.add_argument('--hard_negative_dir',
+                        default='/mnt/vdb1/logic/kws_hard_negative/librispeech_phoneme_hardneg_v1',
                         help='Root produced by tools/build_librispeech_phoneme_hardneg.py. '
                              'Reads manifests/{train,val,test}.csv and adds wavs as '
                              '_unknown_ hard negatives.')
@@ -674,11 +675,13 @@ def main():
                              'company_background=0.15,gsc_noise=0.20,'
                              'gsc_words=0.30,silence=0.10,librispeech=0.25,'
                              'hard_negative=0.25')
-    parser.add_argument('--hard_negative_category_weights', type=str, default='',
+    parser.add_argument('--hard_negative_category_weights', type=str,
+                        default='hey_phoneme_similar=0.25,camy_phoneme_similar=0.25,reco_phoneme_similar=0.25,local_phoneme_confuser=0.25',
                         help='Comma-separated sampling weights inside hard_negative, '
                              'e.g. hey_phoneme_similar=0.4,camy_phoneme_similar=0.25,'
                              'reco_phoneme_similar=0.2,local_phoneme_confuser=0.15. '
-                             'Empty means equal weight across active categories.')
+                             'Default is equal weight across the four LibriSpeech '
+                             'phoneme hard-negative categories.')
     parser.add_argument('--samples_per_class_per_epoch', type=int, default=0,
                         help='If >0, each epoch samples this many examples per '
                              'top-level class according to the weighted sampler. '
