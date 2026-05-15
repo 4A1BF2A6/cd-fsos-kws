@@ -481,7 +481,7 @@ def main():
                         help='EMA smoothing on softmax probs (1.0=off, 0.3=strong). Default 1.0')
     parser.add_argument('--hop_ms', type=int, default=20,
                         help='Inference hop in milliseconds (default: 20)')
-    parser.add_argument('--trigger_frames', type=int, default=3,
+    parser.add_argument('--trigger_frames', type=int, default=10,
                         help='Consecutive above-threshold frames to trigger (default: 3)')
     parser.add_argument('--cooldown_ms', type=int, default=1000,
                         help='Suppression window after trigger in ms (default: 1000)')
