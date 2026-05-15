@@ -764,9 +764,12 @@ def main():
         print(f'Head: {args.head}  hidden={args.head_hidden}  dropout={args.head_dropout}')
     else:
         print(f'Head: {args.head}')
-    print('Crop/Input: {} -> {}  window={}ms  hop={}ms  agg={}  window_batch={}'.format(
-        args.crop_strategy, input_strategy, args.sliding_window_ms, args.sliding_hop_ms,
-        args.sliding_agg, args.sliding_window_batch))
+    if input_strategy == 'sliding':
+        print('Crop/Input: {} -> {}  window={}ms  hop={}ms  agg={}  window_batch={}'.format(
+            args.crop_strategy, input_strategy, args.sliding_window_ms, args.sliding_hop_ms,
+            args.sliding_agg, args.sliding_window_batch))
+    else:
+        print('Crop/Input: {} -> {}'.format(args.crop_strategy, input_strategy))
     print('Augment: gain_db=±{:.3g}  silence_pad={}ms'.format(
         args.augment_gain_db, args.augment_silence_pad_ms))
     print(f'Model on: head={next(model.head.parameters()).device}  encoder={next(model.encoder.parameters()).device}')
