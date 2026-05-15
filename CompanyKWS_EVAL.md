@@ -79,7 +79,7 @@ python target_adapting_querying.py \
 | `--speech.task` | 任务名 | `CompanyKWS_ALL` 用全部 wake；或 `wake_a,wake_b,...` 显式列举 |
 | `--speech.default_datadir` | 数据根目录 | 必须以 `/` 结尾，指向上节布局的 `<root>/` |
 | `--speech.channel` | 取哪一路通道 | 默认 `ch07`（DSP 增强）；想看原始阵列效果改 `ch01` |
-| `--speech.crop_strategy` | 变长音频裁剪策略 | `center` 取几何中段；`energy` 用 1s 滑窗找 RMS 能量峰值；`stretch` 把整条音频重采样压缩/拉伸到 1s（保留所有音节，推荐用于慢速 ~3.7s 样本） |
+| `--speech.crop_strategy` | 变长音频裁剪策略 | `pad` 保留原始时长并在 batch 内补零（推荐）；`center` 取几何中段；`energy` 用 1s 滑窗找 RMS 能量峰值 |
 | `--speech.merge_val` | 验证集去向 | `none` 不动；`train` 合进训练集；`test` 合进测试集（默认 `none`，仓库本来不用 val） |
 | `--speech.gsc_unknown_dir` | 更难的负样本来源 | 指向 GSC `speech_commands_v0.02/` 根目录；设了之后把 GSC 人声词条注入 `_unknown_` 类（testing only），让 AUROC 更有参考价值 |
 | `--speech.gsc_unknown_words` | 注入哪些 GSC 词 | 逗号分隔，默认 `backward,forward,visual,follow,learn,bed,bird,cat,dog` |
@@ -222,7 +222,7 @@ python source_pretraining.py \
 
 | 文件 | 作用 |
 |---|---|
-| `data/CompanyKWS.py` | 新数据集 wrapper（变长裁剪、speaker-disjoint 切分、可选 `_unknown_` 背景切片 + GSC 人声负样本注入、`stretch` 裁剪策略） |
+| `data/CompanyKWS.py` | 新数据集 wrapper（变长裁剪、speaker-disjoint 切分、可选 `_unknown_` 背景切片 + GSC 人声负样本注入） |
 | `parser_kws.py` | 新增 `--speech.channel` / `--speech.crop_strategy` / `--speech.merge_val` |
 | `target_adapting_querying.py` | 新增 `CompanyKWS` 分发分支 + 修闭集兼容性 bug + 负集 loader fallback |
 | `source_pretraining.py` | 放开 `speech.dataset` 写死覆盖 + 新增 `CompanyKWS` 分发分支 |

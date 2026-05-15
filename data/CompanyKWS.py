@@ -102,20 +102,29 @@ class CompanyKWSDataset:
         self.foreground_volume = args['foreground_volume']
         self.time_shift_ms = args['time_shift']
         self.desired_samples = int(self.sample_rate * self.clip_duration_ms / 1000)
+        self.augment_gain_db = float(args.get('augment_gain_db', 0.0))
+        self.augment_silence_pad_ms = int(args.get('augment_silence_pad_ms', 0))
 
         self.use_background = args['include_noise']
         self.background_volume = args['bg_volume']
         self.background_frequency = args['bg_frequency']
 
-        self.silence = args['include_silence']
-        self.silence_num_samples = args['num_silence']
         self.unknown = args['include_unknown']
+        self.silence_as_unknown = bool(args.get('silence_as_unknown', False))
+        if self.silence_as_unknown and not self.unknown:
+            print('[CompanyKWS] WARNING: silence_as_unknown=True requires include_unknown=True; disabling.')
+            self.silence_as_unknown = False
+        self.silence = args['include_silence'] and not self.silence_as_unknown
+        self.silence_num_samples = args['num_silence']
 
         self.channel = args.get('channel', 'ch07')
         self.crop_strategy = args.get('crop_strategy', 'center')
-        if self.crop_strategy not in ('center', 'energy', 'stretch', 'pad'):
-            raise ValueError("crop_strategy must be 'center', 'energy', 'stretch' or 'pad', got {}".format(self.crop_strategy))
-        # 'pad' mode upper bound; samples longer than this get energy-cropped.
+        if self.crop_strategy not in ('center', 'energy', 'pad', 'sliding'):
+            raise ValueError(
+                "crop_strategy must be 'center', 'energy', 'pad' or 'sliding', got {}".format(
+                    self.crop_strategy))
+        # Variable-length strategies use this upper bound; samples longer than
+        # this get energy-cropped before batching/windowing.
         self.max_duration_ms = int(args.get('max_duration_ms', 3100))
         self.max_duration_samples = int(self.sample_rate * self.max_duration_ms / 1000)
         self.merge_val = args.get('merge_val', 'none')
@@ -272,12 +281,14 @@ class CompanyKWSDataset:
     def dataset_filter_class(self, dslist, classes):
         return [item for item in dslist if item['label'] in classes]
 
-    def get_transform_dataset(self, file_dict, classes, filters=None):
+    def get_transform_dataset(self, file_dict, classes, filters=None, augment=False):
         transforms = compose([
             partial(self.load_audio, 'file', 'label', 'data'),
             partial(self.adjust_volume, 'data'),
+            partial(self.random_gain, augment, 'data'),
+            partial(self.random_silence_pad, augment, 'data', 'label'),
             partial(self.shift_and_pad, 'data'),
-            partial(self.mix_background, self.use_background, 'data', 'label'),
+            partial(self.mix_background, self.use_background and augment, 'data', 'label'),
             partial(self.label_to_idx, 'label', 'label_idx'),
         ])
         file_dict = self.dataset_filter_class(file_dict, classes)
@@ -328,11 +339,9 @@ class CompanyKWSDataset:
         return d
 
     def shift_and_pad(self, key, d):
-        # Pad mode keeps samples at their native variable length — the random
-        # time-shift trick depends on a fixed desired_samples window, so we skip
-        # the augmentation entirely here. (Time-shift on already-variable
-        # samples isn't meaningful: the wake word is already where it is.)
-        if self.crop_strategy == 'pad':
+        # Variable-length modes keep samples at their native length. The random
+        # time-shift trick depends on a fixed desired_samples window, so skip it.
+        if self.crop_strategy in ('pad', 'sliding'):
             return d
 
         audio = d[key]
@@ -363,14 +372,43 @@ class CompanyKWSDataset:
         d[key] = d[key] * self.foreground_volume
         return d
 
+    def random_gain(self, augment, key, d):
+        if not augment or self.augment_gain_db <= 0:
+            return d
+        gain_db = np.random.uniform(-self.augment_gain_db, self.augment_gain_db)
+        gain = float(10 ** (gain_db / 20.0))
+        d[key] = torch.clamp(d[key] * gain, -1.0, 1.0)
+        return d
+
+    def random_silence_pad(self, augment, key, key_label, d):
+        if not augment or self.augment_silence_pad_ms <= 0:
+            return d
+        # Only shift real wake-word positives. Unknown/background samples already
+        # have their own duration distribution and should not get a length cue.
+        if d[key_label] in (UNKNOWN_WORD_LABEL, SILENCE_LABEL):
+            return d
+        max_pad = int(self.augment_silence_pad_ms * self.sample_rate / 1000)
+        if max_pad <= 0:
+            return d
+        pre = np.random.randint(0, max_pad + 1)
+        post = np.random.randint(0, max_pad + 1)
+        if pre == 0 and post == 0:
+            return d
+        audio = F.pad(d[key], (pre, post), 'constant', 0)
+        if self.crop_strategy in ('pad', 'sliding') and audio.size(1) > self.max_duration_samples:
+            start = self._energy_crop_start(audio, self.max_duration_samples)
+            audio = audio[:, start:start + self.max_duration_samples]
+        d[key] = audio
+        return d
+
     def load_audio(self, key_path, key_label, out_field, d):
         # Shallow-copy so we don't permanently mutate the underlying record dict
         # (torchnet's ListDataset returns the same instance on each access).
         d = dict(d)
         # Fixed-length modes pre-allocate target_len = desired + max time-shift so
-        # the subsequent shift_and_pad has slack to slide within. Pad mode keeps
-        # samples native up to max_duration_samples (energy-cropped if longer).
-        if self.crop_strategy == 'pad':
+        # the subsequent shift_and_pad has slack to slide within. Variable-length
+        # modes keep samples native up to max_duration_samples.
+        if self.crop_strategy in ('pad', 'sliding'):
             target_len = self.max_duration_samples
         else:
             target_len = self.desired_samples + int(self.time_shift_ms * self.sample_rate / 1000)
@@ -404,15 +442,22 @@ class CompanyKWSDataset:
             d[out_field] = sound
             return d
 
+        if d.pop('is_silence', False):
+            dur_s = d.pop('silence_duration_seconds', None)
+            if dur_s is None:
+                silence_len = self.desired_samples
+            else:
+                silence_len = max(1, int(dur_s * self.sample_rate))
+            d[out_field] = torch.zeros(1, silence_len)
+            return d
+
         sound, sr = torchaudio.load(d[key_path], normalize=True)
         if sound.size(0) > 1:
             sound = sound.mean(dim=0, keepdim=True)
         if sr != self.sample_rate:
             sound = AF.resample(sound, sr, self.sample_rate)
 
-        if self.crop_strategy == 'stretch':
-            sound = self._stretch_to_target(sound, target_len)
-        elif self.crop_strategy == 'pad':
+        if self.crop_strategy in ('pad', 'sliding'):
             # Variable-length: only crop the tail (>3.1s) via energy peak;
             # keep native length otherwise.
             if sound.size(1) > target_len:
@@ -463,21 +508,6 @@ class CompanyKWSDataset:
         max_offset = max_possible - dur_s
         offset_s = rng.uniform(0.0, max_offset) if max_offset > 0 else 0.0
         return offset_s, dur_s
-
-    def _stretch_to_target(self, sound, target_len):
-        """Time-stretch waveform to exactly target_len samples.
-
-        Uses linear interpolation (F.interpolate) instead of sinc resampling —
-        10-20x faster on CPU, sufficient quality for MFCC feature extraction.
-        """
-        orig_len = sound.size(1)
-        if orig_len == target_len:
-            return sound
-        # F.interpolate expects (N, C, L); sound is (1, L)
-        stretched = F.interpolate(
-            sound.unsqueeze(0), size=target_len, mode='linear', align_corners=False
-        ).squeeze(0)
-        return stretched
 
     def load_background_data(self):
         background_data = []
@@ -582,19 +612,25 @@ class CompanyKWSDataset:
                             'bg_duration_seconds': bg_dur,
                         })
 
-        # silence samples
-        if self.silence and len(self.data_set['training']) > 0:
+        # silence samples. In classifier training we usually merge them into
+        # _unknown_ so deployment keeps a single rejection class.
+        if (self.silence or self.silence_as_unknown) and len(self.data_set['training']) > 0:
             silence_wav_path = self.data_set['training'][0]['file']
+            rng_sil = random.Random(RANDOM_SEED + 53)
             for split in ['validation', 'testing', 'training']:
                 set_size = len(self.data_set[split])
                 if set_size == 0:
                     continue
                 silence_size = int(math.ceil(set_size * training_parameters['silence_percentage'] / 100))
                 for _ in range(silence_size):
+                    entry_label = UNKNOWN_WORD_LABEL if self.silence_as_unknown else SILENCE_LABEL
+                    dur_ms = rng_sil.uniform(self.bg_duration_min_ms, self.bg_duration_max_ms)
                     self.data_set[split].append({
-                        'label': SILENCE_LABEL,
+                        'label': entry_label,
                         'file': silence_wav_path,
                         'speaker': 'None',
+                        'is_silence': True,
+                        'silence_duration_seconds': dur_ms / 1000.0,
                     })
 
         # Inject GSC human-speech words as harder _unknown_ negatives
@@ -768,14 +804,21 @@ class CompanyKWSDataset:
         # surface split sizes for visibility
         def _count_unk(split):
             return sum(1 for r in self.data_set[split] if r['label'] == UNKNOWN_WORD_LABEL)
+        def _count_silence_unk(split):
+            return sum(1 for r in self.data_set[split] if r.get('is_silence', False)
+                       and r['label'] == UNKNOWN_WORD_LABEL)
         print('[CompanyKWS] channel={} | crop={} | merge_val={} | unknown={} | wakes={} | '
               'speakers train/val/test = {}/{}/{} | '
               'samples train/val/test = {}/{}/{} | '
-              '_unknown_ in train/val/test = {}/{}/{}'.format(
+              '_unknown_ in train/val/test = {}/{}/{} | '
+              'silence-as-unknown = {}/{}/{}'.format(
                   self.channel, self.crop_strategy, self.merge_val, self.unknown,
                   len(training_parameters['wanted_words']),
                   len(train_set), len(val_set), len(test_set),
                   len(self.data_set['training']),
                   len(self.data_set['validation']),
                   len(self.data_set['testing']),
-                  _count_unk('training'), _count_unk('validation'), _count_unk('testing')))
+                  _count_unk('training'), _count_unk('validation'), _count_unk('testing'),
+                  _count_silence_unk('training'),
+                  _count_silence_unk('validation'),
+                  _count_silence_unk('testing')))

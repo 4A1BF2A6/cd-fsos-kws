@@ -99,10 +99,9 @@ parser.add_argument('--speech.foreground_volume', type=float, default=1)
 parser.add_argument('--speech.channel', type=str, default='ch07',
                     help='which channel wav to load for CompanyKWS, e.g. ch01/ch07 (default: ch07)')
 parser.add_argument('--speech.crop_strategy', type=str, default='center',
-                    choices=['center', 'energy', 'stretch', 'pad'],
+                    choices=['center', 'energy', 'pad'],
                     help='how to crop variable-length audio to clip_duration: '
                          'center (geometric middle), energy (1s window with max RMS energy), '
-                         'stretch (time-stretch whole utterance to 1s via resampling), '
                          'or pad (keep native variable length up to --speech.max_duration_ms; '
                          'longer samples are energy-cropped). '
                          'Only used by CompanyKWS wrapper. Default: center')
