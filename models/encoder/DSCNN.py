@@ -121,6 +121,7 @@ class DSCNN(nn.Module):
 
 
         ds_cnn_layers = []
+        conv_t_meta = []
 
         for layer_no in range(0,num_layers):
             num_filters = conv_feat[layer_no]
@@ -131,11 +132,13 @@ class DSCNN(nn.Module):
                 # P = ((S-1)*W-S+F)/2, with F = filter size, S = stride, W = input size
                 padding = (   int( (conv_kt[layer_no]-1)  //2 ),  int( (conv_kf[layer_no]-1) //2) )
                 ds_cnn_layers.append( nn.Conv2d(in_channels = 1, out_channels = num_filters, kernel_size = kernel_size, stride = stride, padding = padding_0, bias = True) )
+                conv_t_meta.append((conv_kt[layer_no], conv_st[layer_no], padding_0[0], 1))
                 # ds_cnn_layers.append( AN(num_filters) )
                 ds_cnn_layers.append( nn.BatchNorm2d(num_filters) )
                 ds_cnn_layers.append( nn.ReLU() )
             else:
                 ds_cnn_layers.append( nn.Conv2d(in_channels = num_filters, out_channels = num_filters, kernel_size = kernel_size, stride = stride, padding = (1,1), groups = num_filters, bias = True) )
+                conv_t_meta.append((conv_kt[layer_no], conv_st[layer_no], 1, 1))
                 # ds_cnn_layers.append( AN(num_filters) )
                 ds_cnn_layers.append( nn.BatchNorm2d(num_filters) )
                 ds_cnn_layers.append( nn.ReLU() )
@@ -166,9 +169,10 @@ class DSCNN(nn.Module):
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         self.flatten = Flatten()
 
-        # T-dim stride chain for mask-aware GAP at variable length.
+        # T-dim convolution metadata for mask-aware GAP at variable length.
         # Only used when forward() receives non-None `lengths`.
         self.t_strides = tuple(conv_st)
+        self.t_conv_meta = tuple(conv_t_meta)
 
 
     def forward(self, x, lengths=None):
@@ -183,14 +187,13 @@ class DSCNN(nn.Module):
         # instances that predate these attributes
         if getattr(self, 'return_feat_maps', False):
             return x
-        strides = getattr(self, 't_strides', None)
-        if lengths is None or strides is None:
+        conv_meta = getattr(self, 't_conv_meta', None)
+        if lengths is None or conv_meta is None:
             x = self.avgpool(x)
         else:
             L = lengths.to(x.device).long()
-            for s in strides:
-                if s > 1:
-                    L = (L + s - 1).div(s, rounding_mode='floor')
+            for k, s, p, d in conv_meta:
+                L = (L + 2 * p - d * (k - 1) - 1).div(s, rounding_mode='floor') + 1
             L = L.clamp(min=1)
             Tf = x.size(2)
             t_idx = torch.arange(Tf, device=x.device)

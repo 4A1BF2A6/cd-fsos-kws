@@ -4,6 +4,7 @@ __pycache__/
 demo_data/
 
 # adaptation / classifier training artifacts
+results/
 results/Pretrain_DSCNN_MSWC/Adapting_results_*
 results/Pretrain_DSCNN_MSWC/best_adapted_model.pt
 results/Pretrain_DSCNN_MSWC/best_prototypes.pt

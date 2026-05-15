@@ -132,7 +132,10 @@ def load_classifier(ckpt_path, device):
     from train_kws_classifier import KWSClassifier
     ckpt = torch.load(ckpt_path, map_location=device)
     model = KWSClassifier(ckpt['encoder_ckpt'], ckpt['n_classes'],
-                          freeze_encoder=ckpt['freeze_encoder']).to(device)
+                          freeze_encoder=ckpt['freeze_encoder'],
+                          head=ckpt.get('head', 'linear'),
+                          head_hidden=ckpt.get('head_hidden', 128),
+                          head_dropout=ckpt.get('head_dropout', 0.2)).to(device)
     if hasattr(model.preprocessing, 'mfcc'):
         model.preprocessing.mfcc.to(device)
     model.load_state_dict(ckpt['state_dict'])
@@ -491,7 +494,7 @@ def main():
                         help='EMA smoothing on softmax probs (1.0=off, 0.3=strong). Default 1.0')
     parser.add_argument('--hop_ms', type=int, default=20,
                         help='Inference hop in milliseconds (default: 20)')
-    parser.add_argument('--trigger_frames', type=int, default=3,
+    parser.add_argument('--trigger_frames', type=int, default=10,
                         help='Consecutive above-threshold frames to trigger (default: 3)')
     parser.add_argument('--cooldown_ms', type=int, default=1000,
                         help='Suppression window after trigger in ms (default: 1000)')
@@ -517,7 +520,7 @@ def main():
     parser.add_argument('--speech_onset_ms', type=int, default=60,
                         help='Sustained hop count crossing start_thr to confirm '
                              'speech onset (default 60ms = 3 hops at 20ms)')
-    parser.add_argument('--silence_hangover_ms', type=int, default=300,
+    parser.add_argument('--silence_hangover_ms', type=int, default=200,
                         help='Trailing silence to declare segment end (default 300ms)')
     parser.add_argument('--min_speech_ms', type=int, default=200,
                         help='Discard segments shorter than this (default 200ms)')
