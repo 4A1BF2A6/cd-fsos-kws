@@ -489,6 +489,8 @@ def evaluate(model, ds, split, batch_size, device, num_workers=4, pin_memory=Tru
     """
     from metrics import compute_metrics
 
+    from metrics import compute_metrics
+
     word_to_index = ds.word_to_index
     n_classes = len(word_to_index)
     unk_id = word_to_index.get('_unknown_')
