@@ -119,6 +119,12 @@ class KWSClassifier(nn.Module):
 
 def build_speech_args(args):
     """Mimic parser_kws.py defaults so CompanyKWSDataset can ingest."""
+    silence_mode = args.silence_mode
+    # 'merge' → silence records labeled _unknown_ (current behavior)
+    # 'split' → silence records form a dedicated _silence_ class
+    # 'none'  → no silence records added
+    include_silence = (silence_mode == 'split')
+    silence_as_unknown = (silence_mode == 'merge')
     return {
         'sample_rate':      16000,
         'clip_duration':    1000,
@@ -133,9 +139,10 @@ def build_speech_args(args):
         'include_noise':    True,
         'bg_volume':        0.1,
         'bg_frequency':     1.0,
-        'include_silence':  False,
+        'include_silence':  include_silence,
         'num_silence':      0,
-        'silence_as_unknown': not args.no_silence_unknown,
+        'silence_percentage': args.silence_percentage,
+        'silence_as_unknown': silence_as_unknown,
         'include_unknown':  True,
         'channel':          args.channel,
         'crop_strategy':    args.crop_strategy,
@@ -149,6 +156,7 @@ def build_speech_args(args):
         'librispeech_max_files': args.librispeech_max_files,
         'gsc_noise_dir':    args.gsc_noise_dir,
         'gsc_noise_samples_per_file': args.gsc_noise_samples_per_file,
+        'hard_negative_dir': args.hard_negative_dir,
         'bg_duration_min_ms': args.bg_duration_min_ms,
         'bg_duration_max_ms': args.bg_duration_max_ms,
     }
@@ -163,7 +171,12 @@ def unknown_source(record):
     """
     if record.get('is_silence', False):
         return 'silence'
+    explicit_source = record.get('unknown_source')
+    if explicit_source:
+        return explicit_source
     speaker = str(record.get('speaker', ''))
+    if speaker.startswith('hard_negative_'):
+        return 'hard_negative'
     if speaker == 'gsc_unknown':
         return 'gsc_words'
     if speaker.startswith('librispeech_'):
@@ -182,6 +195,7 @@ def parse_unknown_source_weights(text):
         'gsc_words': 0.25,
         'silence': 0.10,
         'librispeech': 0.10,
+        'hard_negative': 0.25,
         'unknown_other': 0.10,
     }
     if not text:
@@ -199,19 +213,45 @@ def parse_unknown_source_weights(text):
     return out
 
 
+def parse_hard_negative_category_weights(text):
+    """Parse hard-negative category sampling weights.
+
+    Empty text means equal weight across active manifest categories.
+    """
+    if not text:
+        return {}
+    out = {}
+    for item in text.split(','):
+        item = item.strip()
+        if not item:
+            continue
+        if '=' not in item:
+            raise ValueError(
+                '--hard_negative_category_weights entries must be name=value, got {}'.format(item))
+        name, value = item.split('=', 1)
+        out[name.strip()] = float(value)
+    return out
+
+
 def build_sample_weights(records, word_to_index, unknown_source_weights=None,
+                         hard_negative_category_weights=None,
                          samples_per_class_per_epoch=0):
     """Balance wake classes and stratify _unknown_ by source bucket."""
     n_classes = len(word_to_index)
     counts = [0] * n_classes
     unknown_label = '_unknown_'
     source_counts = {}
+    hardneg_category_counts = {}
     unknown_source_weights = unknown_source_weights or parse_unknown_source_weights(None)
+    hard_negative_category_weights = hard_negative_category_weights or {}
     for r in records:
         counts[word_to_index[r['label']]] += 1
         if r['label'] == unknown_label:
             src = unknown_source(r)
             source_counts[src] = source_counts.get(src, 0) + 1
+            if src == 'hard_negative':
+                cat = r.get('hardneg_category', 'unknown_hard_negative')
+                hardneg_category_counts[cat] = hardneg_category_counts.get(cat, 0) + 1
 
     active_source_weights = {
         src: unknown_source_weights.get(src, unknown_source_weights.get('unknown_other', 0.0))
@@ -227,7 +267,20 @@ def build_sample_weights(records, word_to_index, unknown_source_weights=None,
         if r['label'] == unknown_label and source_counts:
             src = unknown_source(r)
             src_weight = max(0.0, active_source_weights.get(src, 0.0)) / total_source_weight
-            weights.append(src_weight / source_counts[src])
+            if src == 'hard_negative' and hardneg_category_counts:
+                cat = r.get('hardneg_category', 'unknown_hard_negative')
+                active_cat_weights = {
+                    active_cat: hard_negative_category_weights.get(active_cat, 1.0)
+                    for active_cat in hardneg_category_counts
+                }
+                total_cat_weight = sum(w for w in active_cat_weights.values() if w > 0)
+                if total_cat_weight <= 0:
+                    raise ValueError('All active hard-negative category weights are <= 0: {}'.format(
+                        active_cat_weights))
+                cat_weight = max(0.0, active_cat_weights.get(cat, 0.0)) / total_cat_weight
+                weights.append(src_weight * cat_weight / hardneg_category_counts[cat])
+            else:
+                weights.append(src_weight / source_counts[src])
         else:
             weights.append(1.0 / counts[word_to_index[r['label']]])
     if samples_per_class_per_epoch and samples_per_class_per_epoch > 0:
@@ -243,15 +296,28 @@ def build_sample_weights(records, word_to_index, unknown_source_weights=None,
             k: round(max(0.0, v) / total_source_weight, 4)
             for k, v in sorted(active_source_weights.items())
         })
+    if hardneg_category_counts:
+        active_cat_weights = {
+            cat: hard_negative_category_weights.get(cat, 1.0)
+            for cat in hardneg_category_counts
+        }
+        total_cat_weight = sum(w for w in active_cat_weights.values() if w > 0)
+        print('  hard-negative category counts:', dict(sorted(hardneg_category_counts.items())))
+        print('  hard-negative category sampling weights:', {
+            k: round(max(0.0, v) / total_cat_weight, 4)
+            for k, v in sorted(active_cat_weights.items())
+        })
     print('  samples per epoch:', num_samples)
     return weights, num_samples
 
 
 def make_weighted_sampler(records, word_to_index, unknown_source_weights=None,
+                          hard_negative_category_weights=None,
                           samples_per_class_per_epoch=0):
     weights, num_samples = build_sample_weights(
         records, word_to_index,
         unknown_source_weights=unknown_source_weights,
+        hard_negative_category_weights=hard_negative_category_weights,
         samples_per_class_per_epoch=samples_per_class_per_epoch)
     return WeightedRandomSampler(weights, num_samples=num_samples, replacement=True)
 
@@ -301,6 +367,7 @@ class WeightedLengthBucketBatchSampler:
 
 def get_iid_dataloader_balanced(ds, split, batch_size, num_workers=4, pin_memory=True,
                                 unknown_source_weights=None,
+                                hard_negative_category_weights=None,
                                 samples_per_class_per_epoch=0,
                                 length_bucket_ms=500):
     """Like ds.get_iid_dataloader but with WeightedRandomSampler for balance.
@@ -314,6 +381,7 @@ def get_iid_dataloader_balanced(ds, split, batch_size, num_workers=4, pin_memory
     weights, num_samples = build_sample_weights(
         records, ds.word_to_index,
         unknown_source_weights=unknown_source_weights,
+        hard_negative_category_weights=hard_negative_category_weights,
         samples_per_class_per_epoch=samples_per_class_per_epoch)
     if length_bucket_ms and length_bucket_ms > 0:
         bucket_samples = max(1, int(ds.sample_rate * length_bucket_ms / 1000))
@@ -426,16 +494,29 @@ def input_strategy_from_crop(crop_strategy):
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def collect_predictions(model, loader, n_classes, unk_id, device,
-                        force_unk_labels=False, desc='eval',
+def collect_predictions(model, loader, n_classes, reject_ids, device,
+                        force_label_idx=None, desc='eval',
                         input_strategy='pad',
                         sliding_window_ms=1000,
                         sliding_hop_ms=250,
                         sliding_agg='max_logit',
                         sliding_window_batch=1024):
+    """
+    reject_ids       : list of class indices treated as rejection (e.g. _unknown_,
+                       _silence_). Their probabilities are dropped from `close`
+                       and summed into `ood`.
+    force_label_idx  : if not None, override every sample's true label with this
+                       idx (used by the negative loader to collapse all rejection
+                       sources to a single bucket).
+    """
     model.eval()
+    reject_ids = list(reject_ids) if reject_ids else []
     y_score, y_pred, y_true = [], [], []
     y_pred_close, y_pred_ood = [], []
+
+    if reject_ids:
+        keep_mask_1d = torch.ones(n_classes, dtype=torch.bool)
+        keep_mask_1d[torch.tensor(reject_ids, dtype=torch.long)] = False
 
     for batch in tqdm(loader, desc=desc, leave=False):
         x = batch['data'].to(device)
@@ -453,11 +534,10 @@ def collect_predictions(model, loader, n_classes, unk_id, device,
         _, pred = p_y.max(1)
         conf = p_y.gather(1, pred.unsqueeze(1)).squeeze(1)
 
-        if unk_id is not None:
-            unk_lab = torch.full((p_y.size(0),), unk_id, dtype=torch.long)
-            mask = (1 - F.one_hot(unk_lab, n_classes)).bool()
-            close = p_y[mask].reshape(p_y.size(0), -1)
-            ood = p_y[:, unk_id]
+        if reject_ids:
+            keep_mask = keep_mask_1d.unsqueeze(0).expand(p_y.size(0), -1)
+            close = p_y[keep_mask].reshape(p_y.size(0), -1)
+            ood = p_y[:, reject_ids].sum(dim=1)
         else:
             close = p_y
             ood = None
@@ -467,12 +547,12 @@ def collect_predictions(model, loader, n_classes, unk_id, device,
         y_pred_close.extend(close.tolist())
         if ood is not None:
             y_pred_ood.extend(ood.tolist())
-        if force_unk_labels:
-            y_true.extend([unk_id] * x.size(0))
+        if force_label_idx is not None:
+            y_true.extend([force_label_idx] * x.size(0))
         else:
             y_true.extend(batch['label_idx'].tolist())
 
-    return y_score, y_pred, y_true, y_pred_close, (y_pred_ood if unk_id is not None else None)
+    return y_score, y_pred, y_true, y_pred_close, (y_pred_ood if reject_ids else None)
 
 
 def evaluate(model, ds, split, batch_size, device, num_workers=4, pin_memory=True,
@@ -481,7 +561,8 @@ def evaluate(model, ds, split, batch_size, device, num_workers=4, pin_memory=Tru
              sliding_hop_ms=250,
              sliding_agg='max_logit',
              sliding_window_batch=1024):
-    """Compute compute_metrics() on a given split. Splits into pos (wake) and neg (_unknown_).
+    """Compute compute_metrics() on a given split. Splits into pos (wake) and
+    neg (rejection pool = _silence_ + _unknown_ when both present).
 
     pos/neg loaders parallel-load audio in num_workers processes so validation
     doesn't stall the GPU between epochs. Default 4 is a safe middle ground
@@ -503,8 +584,16 @@ def evaluate(model, ds, split, batch_size, device, num_workers=4, pin_memory=Tru
             out.extend(ds.dataset_filter_class(ds.data_set[split_item], classes))
         return out
 
-    pos_classes = [w for w in ds.words_list if w != '_unknown_']
-    neg_classes = ['_unknown_'] if unk_id is not None else []
+    # Both _silence_ and _unknown_ are 'rejection' from the deployment's point
+    # of view. We let the model keep them as distinct softmax outputs during
+    # training (for cleaner decision boundaries), but at metric time we collapse
+    # them into a single bucket so compute_metrics() (which only knows about
+    # _unknown_) keeps working unchanged.
+    reject_classes = [w for w in ('_silence_', '_unknown_') if w in word_to_index]
+    reject_ids = [word_to_index[w] for w in reject_classes]
+    reject_set = set(reject_ids)
+    pos_classes = [w for w in ds.words_list if w not in reject_classes]
+    neg_classes = list(reject_classes)
 
     loader_kwargs = dict(
         batch_size=batch_size, shuffle=False,
@@ -518,21 +607,22 @@ def evaluate(model, ds, split, batch_size, device, num_workers=4, pin_memory=Tru
     pos_loader = DataLoader(ds.get_transform_dataset(pos_records, pos_classes),
                             **loader_kwargs)
     y_score_p, y_pred_p, y_true_p, y_close_p, y_ood_p = collect_predictions(
-        model, pos_loader, n_classes, unk_id, device, desc=f'{split_name} pos',
+        model, pos_loader, n_classes, reject_ids, device, desc=f'{split_name} pos',
         input_strategy=input_strategy,
         sliding_window_ms=sliding_window_ms,
         sliding_hop_ms=sliding_hop_ms,
         sliding_agg=sliding_agg,
         sliding_window_batch=sliding_window_batch)
 
-    if neg_classes:
+    neg_records = []
+    if neg_classes and unk_id is not None:
         neg_records = _records_for(neg_classes)
         if neg_records:
             neg_loader = DataLoader(ds.get_transform_dataset(neg_records, neg_classes),
                                     **loader_kwargs)
             y_score_n, y_pred_n, y_true_n, y_close_n, y_ood_n = collect_predictions(
-                model, neg_loader, n_classes, unk_id, device,
-                force_unk_labels=True, desc=f'{split_name} neg',
+                model, neg_loader, n_classes, reject_ids, device,
+                force_label_idx=unk_id, desc=f'{split_name} neg',
                 input_strategy=input_strategy,
                 sliding_window_ms=sliding_window_ms,
                 sliding_hop_ms=sliding_hop_ms,
@@ -543,10 +633,51 @@ def evaluate(model, ds, split, batch_size, device, num_workers=4, pin_memory=Tru
     else:
         y_score_n = y_pred_n = y_true_n = y_close_n = y_ood_n = None
 
-    return compute_metrics(
+    # Collapse silence-predictions into the unknown bucket so downstream
+    # FRR/threshold arithmetic in compute_metrics (which compares against
+    # `_unknown_` only) treats both rejection sources uniformly.
+    if unk_id is not None and len(reject_set) > 1:
+        y_pred_p = [unk_id if p in reject_set else p for p in y_pred_p]
+        if y_pred_n is not None:
+            y_pred_n = [unk_id if p in reject_set else p for p in y_pred_n]
+
+    result = compute_metrics(
         y_score_p, y_pred_p, y_true_p, y_close_p, y_ood_p,
         y_score_n, y_pred_n, y_true_n, y_close_n, y_ood_n,
         word_to_index, target_far=0.05, verbose=False)
+
+    # Per-source false-alarm breakdown. The 3x3 collapsed confusion matrix in
+    # compute_metrics hides which rejection source contributed each FA; this
+    # block recovers that detail by zipping (un-shuffled) neg_records with
+    # post-collapse y_pred_n, and bucketing by unknown_source() (which routes
+    # silence records to the 'silence' bucket regardless of split/merge mode).
+    if y_pred_n is not None and neg_records and pos_classes:
+        wake_idx_to_name = {word_to_index[w]: w for w in pos_classes}
+        source_stats = {}
+        for record, pred in zip(neg_records, y_pred_n):
+            src = unknown_source(record)
+            s = source_stats.setdefault(src, {'total': 0, 'fa': 0, 'per_wake': {}})
+            s['total'] += 1
+            if pred in wake_idx_to_name:
+                s['fa'] += 1
+                wake_name = wake_idx_to_name[pred]
+                s['per_wake'][wake_name] = s['per_wake'].get(wake_name, 0) + 1
+        print('  per-source FA breakdown ({}):'.format(split_name))
+        total_fa = sum(s['fa'] for s in source_stats.values())
+        total_n  = sum(s['total'] for s in source_stats.values())
+        for src in sorted(source_stats):
+            st = source_stats[src]
+            far = 100.0 * st['fa'] / st['total'] if st['total'] else 0.0
+            bd = ', '.join('{}:{}'.format(w, st['per_wake'][w])
+                           for w in sorted(st['per_wake']))
+            bd = bd or '-'
+            print('    {:<20} total={:<6} fa={:<5} FAR={:6.2f}%  {}'.format(
+                src, st['total'], st['fa'], far, bd))
+        far_total = 100.0 * total_fa / total_n if total_n else 0.0
+        print('    {:<20} total={:<6} fa={:<5} FAR={:6.2f}%'.format(
+            'ALL', total_n, total_fa, far_total))
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -570,10 +701,24 @@ def main():
                         help="Upper bound for variable-length crop strategies "
                              'pad/sliding (energy-crop longer samples). '
                              'Default 3100 (CompanyKWS P99).')
-    parser.add_argument('--no_silence_unknown', action='store_true',
-                        help='Disable adding pure-silence samples to the _unknown_ class.')
+    parser.add_argument('--silence_mode',
+                        choices=['merge', 'split', 'none'],
+                        default='split',
+                        help="How to handle pure-silence samples. "
+                             "'merge' (default): label them _unknown_ alongside other "
+                             "rejection sources (legacy behavior). "
+                             "'split': give them a dedicated _silence_ class — "
+                             "metric layer still treats _silence_ + _unknown_ as one "
+                             "rejection bucket, but the model learns two separate logits. "
+                             "'none': do not add silence samples at all.")
+    parser.add_argument('--silence_percentage', type=float, default=100.0,
+                        help='Percent of split size to inject as silence samples '
+                             '(used by both merge/split modes; ignored when none).')
     parser.add_argument('--gsc_unknown_words', type=str,
-                        default='backward,forward,visual,follow,learn,bed,bird,cat,dog')
+                        default='backward,bed,bird,cat,dog,down,eight,five,follow,forward,'
+                                'four,go,happy,house,learn,left,marvin,nine,no,off,'
+                                'on,one,right,seven,sheila,six,stop,three,tree,two,'
+                                'up,visual,wow,yes,zero')
     parser.add_argument('--librispeech_dir', default=None,
                         help='LibriSpeech root (e.g. .../train-clean-100/). Adds random '
                              '1s slices of continuous English speech to _unknown_ class')
@@ -587,6 +732,11 @@ def main():
                              '<gsc_dir>/_background_noise_/')
     parser.add_argument('--gsc_noise_samples_per_file', type=int, default=50,
                         help='Random slices per GSC noise wav (default: 50)')
+    parser.add_argument('--hard_negative_dir',
+                        # default='/mnt/vdb1/logic/kws_hard_negative/librispeech_phoneme_hardneg_v1',
+                        help='Root produced by tools/build_librispeech_phoneme_hardneg.py. '
+                             'Reads manifests/{train,val,test}.csv and adds wavs as '
+                             '_unknown_ hard negatives.')
     parser.add_argument('--bg_duration_min_ms', type=int, default=500,
                         help='Lower bound on random duration for _unknown_ slices '
                              '(default 500ms, matches wake-word P1)')
@@ -606,11 +756,19 @@ def main():
     parser.add_argument('--head_dropout', type=float, default=0.4,
                         help='Dropout for --head mlp. Default: 0.3.')
     parser.add_argument('--unknown_source_weights', type=str,
-                        default='company_background=0.15,gsc_noise=0.20,gsc_words=0.30,silence=0.10,librispeech=0.25',
+                        default='company_background=0.05,gsc_noise=0.05,gsc_words=0.30,silence=0.02,librispeech=0.20,hard_negative=0.40',
                         help='Comma-separated sampling weights inside _unknown_. '
                              'Active sources are renormalized. Default: '
                              'company_background=0.15,gsc_noise=0.20,'
-                             'gsc_words=0.30,silence=0.10,librispeech=0.25')
+                             'gsc_words=0.30,silence=0.10,librispeech=0.25,'
+                             'hard_negative=0.25')
+    parser.add_argument('--hard_negative_category_weights', type=str,
+                        default='hey_phoneme_similar=0.35,camy_phoneme_similar=0.25,reco_phoneme_similar=0.25,local_phoneme_confuser=0.10,hey_nonwake=0.05',
+                        help='Comma-separated sampling weights inside hard_negative, '
+                             'e.g. hey_phoneme_similar=0.4,camy_phoneme_similar=0.25,'
+                             'reco_phoneme_similar=0.2,local_phoneme_confuser=0.15. '
+                             'Default is equal weight across the five LibriSpeech '
+                             'phoneme hard-negative categories (hey_nonwake is v2-only).')
     parser.add_argument('--samples_per_class_per_epoch', type=int, default=0,
                         help='If >0, each epoch samples this many examples per '
                              'top-level class according to the weighted sampler. '
@@ -693,9 +851,12 @@ def main():
         print(f'Head: {args.head}  hidden={args.head_hidden}  dropout={args.head_dropout}')
     else:
         print(f'Head: {args.head}')
-    print('Crop/Input: {} -> {}  window={}ms  hop={}ms  agg={}  window_batch={}'.format(
-        args.crop_strategy, input_strategy, args.sliding_window_ms, args.sliding_hop_ms,
-        args.sliding_agg, args.sliding_window_batch))
+    if input_strategy == 'sliding':
+        print('Crop/Input: {} -> {}  window={}ms  hop={}ms  agg={}  window_batch={}'.format(
+            args.crop_strategy, input_strategy, args.sliding_window_ms, args.sliding_hop_ms,
+            args.sliding_agg, args.sliding_window_batch))
+    else:
+        print('Crop/Input: {} -> {}'.format(args.crop_strategy, input_strategy))
     print('Augment: gain_db=±{:.3g}  silence_pad={}ms'.format(
         args.augment_gain_db, args.augment_silence_pad_ms))
     print(f'Model on: head={next(model.head.parameters()).device}  encoder={next(model.encoder.parameters()).device}')
@@ -705,6 +866,9 @@ def main():
                                                 pin_memory=device.type == 'cuda',
                                                 unknown_source_weights=parse_unknown_source_weights(
                                                     args.unknown_source_weights),
+                                                hard_negative_category_weights=(
+                                                    parse_hard_negative_category_weights(
+                                                        args.hard_negative_category_weights)),
                                                 samples_per_class_per_epoch=(
                                                     args.samples_per_class_per_epoch),
                                                 length_bucket_ms=args.length_bucket_ms)
@@ -801,6 +965,8 @@ def main():
                 'head_hidden':      args.head_hidden,
                 'head_dropout':     args.head_dropout,
                 'unknown_source_weights': args.unknown_source_weights,
+                'hard_negative_dir': args.hard_negative_dir,
+                'hard_negative_category_weights': args.hard_negative_category_weights,
                 'samples_per_class_per_epoch': args.samples_per_class_per_epoch,
                 'length_bucket_ms': args.length_bucket_ms,
                 'sliding_window_ms': args.sliding_window_ms,

@@ -210,11 +210,12 @@ class LiveKWS:
         ax_prob.set_xlabel('time (s, relative to now)')
 
         palette = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd']
+        reject_colors = {'_unknown_': '#888888', '_silence_': '#bbbbbb'}
         colors = []
         pi = 0
         for l in self.labels:
-            if l == '_unknown_':
-                colors.append('#888888')
+            if l in reject_colors:
+                colors.append(reject_colors[l])
             else:
                 colors.append(palette[pi % len(palette)])
                 pi += 1

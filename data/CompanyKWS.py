@@ -6,6 +6,7 @@
 # Train/test split is speaker-disjoint by emp_id.
 
 import os
+import csv
 from functools import partial
 import glob
 import math
@@ -51,7 +52,29 @@ def variable_length_collate(batch):
     for i, b in enumerate(batch):
         T_i = b['data'].size(-1)
         data[i, :, :T_i] = b['data']
-    out = default_collate([{k: v for k, v in b.items() if k != 'data'} for b in batch])
+
+    meta_keys = sorted({k for b in batch for k in b.keys() if k != 'data'})
+    defaults = {}
+    for key in meta_keys:
+        value = next((b[key] for b in batch if key in b), '')
+        if torch.is_tensor(value):
+            defaults[key] = torch.zeros_like(value)
+        elif isinstance(value, bool):
+            defaults[key] = False
+        elif isinstance(value, int):
+            defaults[key] = 0
+        elif isinstance(value, float):
+            defaults[key] = 0.0
+        else:
+            defaults[key] = ''
+
+    normalized = []
+    for b in batch:
+        item = {}
+        for key in meta_keys:
+            item[key] = b.get(key, defaults[key])
+        normalized.append(item)
+    out = default_collate(normalized)
     out['data'] = data
     out['lengths'] = lengths
     return out
@@ -141,6 +164,7 @@ class CompanyKWSDataset:
         # GSC _background_noise_ injection (long noise recordings → variable slices)
         self.gsc_noise_dir = args.get('gsc_noise_dir', None)
         self.gsc_noise_samples_per_file = int(args.get('gsc_noise_samples_per_file', 50))
+        self.hard_negative_dir = args.get('hard_negative_dir', None)
         # Variable-length _unknown_ slice duration bounds (matches wake-word range
         # so the model can't use input length as a free feature).
         self.bg_duration_min_ms = int(args.get('bg_duration_min_ms', 500))
@@ -151,7 +175,7 @@ class CompanyKWSDataset:
 
         # split percentages
         params = {
-            'silence_percentage': 10.0,
+            'silence_percentage': float(args.get('silence_percentage', 10.0)),
             'unknown_percentage': 0.0,    # unknown disabled by default for this dataset
             'validation_percentage': 10.0,
             'testing_percentage': 10.0,
@@ -780,6 +804,61 @@ class CompanyKWSDataset:
                 print('[CompanyKWS] Added {} GSC noise slices from {} files '
                       '(train={}, val={}, test={})'.format(
                           n, len(noise_wavs), n_train, n_val, n - n_train - n_val))
+
+        # Inject manifest-based LibriSpeech phoneme hard negatives.
+        # Expected layout:
+        #   <hard_negative_dir>/manifests/{train,val,test}.csv
+        # with wav_path relative to <hard_negative_dir>.
+        if self.unknown and self.hard_negative_dir:
+            split_files = {
+                'training': 'train.csv',
+                'validation': 'val.csv',
+                'testing': 'test.csv',
+            }
+            per_split_counts = {}
+            category_counts = {}
+            for split, filename in split_files.items():
+                manifest = os.path.join(self.hard_negative_dir, 'manifests', filename)
+                if not os.path.isfile(manifest):
+                    print('[CompanyKWS] hard-negative manifest not found, skipping: {}'.format(manifest))
+                    per_split_counts[split] = 0
+                    continue
+                n_added = 0
+                with open(manifest, 'r', newline='', encoding='utf-8') as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        if row.get('label', UNKNOWN_WORD_LABEL) != UNKNOWN_WORD_LABEL:
+                            continue
+                        wav_path = row.get('wav_path', '')
+                        if not wav_path:
+                            continue
+                        if not os.path.isabs(wav_path):
+                            wav_path = os.path.join(self.hard_negative_dir, wav_path)
+                        if not os.path.isfile(wav_path):
+                            continue
+                        category = row.get('category', 'unknown_hard_negative') or 'unknown_hard_negative'
+                        speaker_id = row.get('speaker_id', 'unknown_speaker') or 'unknown_speaker'
+                        self.data_set[split].append({
+                            'label': UNKNOWN_WORD_LABEL,
+                            'file': wav_path,
+                            'speaker': 'hard_negative_' + speaker_id,
+                            'unknown_source': 'hard_negative',
+                            'hardneg_category': category,
+                            'hardneg_target': row.get('target', ''),
+                            'hardneg_words': row.get('words', ''),
+                            'hardneg_source_utt_id': row.get('source_utt_id', ''),
+                        })
+                        category_counts[category] = category_counts.get(category, 0) + 1
+                        n_added += 1
+                per_split_counts[split] = n_added
+            total = sum(per_split_counts.values())
+            print('[CompanyKWS] Added {} manifest hard negatives '
+                  '(train={}, val={}, test={}) categories={}'.format(
+                      total,
+                      per_split_counts.get('training', 0),
+                      per_split_counts.get('validation', 0),
+                      per_split_counts.get('testing', 0),
+                      dict(sorted(category_counts.items()))))
 
         # optionally absorb validation into another split (default: keep standalone)
         if self.merge_val == 'train' and self.data_set['validation']:
