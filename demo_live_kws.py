@@ -3,7 +3,7 @@ Real-time microphone KWS demo with matplotlib (TkAgg) visualization.
 
 Uses SlidingKWS by default: all microphone audio is continuously fed into a
 fixed rolling window and classified every hop. SegmentKWS is still available
-via --detector segment if you want energy-VAD segmenting later.
+via --detector segment if you want Silero VAD segmenting later.
 
 UI:
   - per-class softmax probability history
@@ -11,7 +11,7 @@ UI:
   - recent trigger log
   - 3 sliders mutable at runtime:
       * threshold
-      * ema_alpha (sliding) or stop_thr (SegmentKWS)
+      * ema_alpha (sliding) or vad_threshold (SegmentKWS)
       * trigger_frames (sliding) or silence_hangover_ms (SegmentKWS)
 
 Every session is dumped to <output_dir>/live_kws_<timestamp>/:
@@ -264,16 +264,19 @@ class LiveKWS:
         slider_thr.on_changed(on_thr)
 
         if self.detector_kind == 'segment':
-            # SegmentKWS knobs: stop_thr (energy gate floor) + silence_hangover_ms
-            slider_b = Slider(ax_b, 'stop_thr', 0.001, 0.05,
-                              valinit=self.detector.stop_thr, valstep=0.001)
+            # SegmentKWS knobs: Silero VAD threshold + silence_hangover_ms
+            slider_b = Slider(ax_b, 'vad_threshold', 0.05, 0.95,
+                              valinit=self.detector.vad_threshold, valstep=0.01)
             cur_hang_ms = self.detector.silence_hangover_frames * self.hop_ms
             slider_c = Slider(ax_c, 'silence_hangover_ms', 100, 1000,
                               valinit=cur_hang_ms, valstep=20)
             def on_b(v):
-                self.detector.stop_thr = float(v)
+                self.detector.vad_threshold = float(v)
+                self.detector._vad_iter.threshold = float(v)
             def on_c(v):
                 self.detector.silence_hangover_frames = max(1, int(v / self.hop_ms))
+                self.detector.silence_hangover_ms = int(v)
+                self.detector._vad_iter.min_silence_samples = int(SR * int(v) / 1000)
             slider_b.on_changed(on_b)
             slider_c.on_changed(on_c)
         else:
@@ -397,17 +400,25 @@ def main():
     parser.add_argument('--detector', choices=['sliding', 'segment'],
                         default='sliding',
                         help='sliding: no VAD, continuously classify a rolling '
-                             'fixed window. segment: energy-VAD then classify '
+                             'fixed window. segment: Silero VAD then classify '
                              'each detected speech segment.')
 
     # SegmentKWS knobs
-    parser.add_argument('--start_thr', type=float, default=0.01)
-    parser.add_argument('--stop_thr', type=float, default=0.005)
-    parser.add_argument('--speech_onset_ms', type=int, default=60)
-    parser.add_argument('--silence_hangover_ms', type=int, default=300)
-    parser.add_argument('--min_speech_ms', type=int, default=200)
-    parser.add_argument('--max_segment_ms', type=int, default=3100)
-    parser.add_argument('--pre_onset_ms', type=int, default=100)
+    parser.add_argument('--vad_threshold', type=float, default=0.5,
+                        help='Silero VAD speech probability threshold '
+                             '(default: 0.5; higher is stricter)')
+    parser.add_argument('--silence_hangover_ms', type=int, default=100,
+                        help='Trailing non-speech duration required before '
+                             'closing a segment, in ms (default: 100)')
+    parser.add_argument('--min_speech_ms', type=int, default=600,
+                        help='Discard detected speech segments shorter than '
+                             'this many ms (default: 200)')
+    parser.add_argument('--max_segment_ms', type=int, default=3000,
+                        help='Force-close and classify a segment after this '
+                             'many ms (default: 2000)')
+    parser.add_argument('--pre_onset_ms', type=int, default=100,
+                        help='Audio padding/backfill kept before Silero speech '
+                             'onset, in ms (default: 100)')
 
     # SlidingKWS knobs (only used with --detector sliding)
     parser.add_argument('--ema_alpha', type=float, default=0.3)
@@ -441,9 +452,7 @@ def main():
             model, labels,
             threshold=threshold,
             hop_ms=args.hop_ms,
-            start_thr=args.start_thr,
-            stop_thr=args.stop_thr,
-            speech_onset_ms=args.speech_onset_ms,
+            vad_threshold=args.vad_threshold,
             silence_hangover_ms=args.silence_hangover_ms,
             min_speech_ms=args.min_speech_ms,
             max_segment_ms=args.max_segment_ms,
@@ -471,8 +480,7 @@ def main():
     print(f'Classes        : {labels}')
     print(f'Threshold      : {threshold:.4f}')
     if args.detector == 'segment':
-        print(f'start_thr      : {args.start_thr}')
-        print(f'stop_thr       : {args.stop_thr}')
+        print(f'vad_threshold : {args.vad_threshold}')
         print(f'silence_hangover_ms : {args.silence_hangover_ms}')
         print(f'max_segment_ms : {args.max_segment_ms}')
     else:

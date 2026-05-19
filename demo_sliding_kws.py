@@ -1,4 +1,4 @@
-"""
+﻿"""
 Sliding-window real-time KWS demo.
 
 Three loading modes:
@@ -14,7 +14,7 @@ Three loading modes:
      Load the pretrained backbone and build prototypes on the fly from
      a support directory (sub-dirs = class labels, each holding wavs).
 
-Usage (mode 3 — recommended):
+Usage (mode 3 鈥?recommended):
     python demo_sliding_kws.py \
         --classifier results/kws_classifier/best.pt \
         --wav <audio.wav> \
@@ -22,6 +22,7 @@ Usage (mode 3 — recommended):
 """
 
 import argparse
+import collections
 import time
 from pathlib import Path
 
@@ -31,7 +32,7 @@ import torchaudio
 
 import numpy as np
 
-import models  # noqa: F401 — registers model builders
+import models  # noqa: F401 鈥?registers model builders
 from models.utils import get_model
 from models.CKAs_module import ReprModel_cka
 from demo_fewshot_wav import (
@@ -48,7 +49,7 @@ def reproj_scores(query, muK, beta, device):
     query : (1, D)
     muK   : (N, D)  L2-normalised prototypes
     beta  : scalar Parameter
-    Returns (N,) scores — higher = more similar (matches evaluation space).
+    Returns (N,) scores 鈥?higher = more similar (matches evaluation space).
     """
     support = muK.unsqueeze(1).to(device)          # (N, 1, D)
     lam = support.size(1) / support.size(2)        # 1/D
@@ -159,26 +160,15 @@ def load_classifier(ckpt_path, device):
 class SegmentKWS:
     """Segment-based KWS detector aligned with variable-length training.
 
-    Instead of sliding a fixed window over continuous audio, we run a simple
-    energy-based VAD state machine to find speech segments, then classify each
-    complete segment as a single variable-length input — exactly matching how
-    the model was trained on variable-length wake-word utterances.
+    Silero VAD finds speech segments, then each complete segment is
+    classified as a single variable-length input.
 
-    State machine (each push() = one hop of audio):
-        IDLE → (RMS > start_thr for ≥ speech_onset_frames consecutive hops)
-             → IN_SPEECH (also backfills pre_onset_ms of audio before onset)
-        IN_SPEECH → (RMS < stop_thr for ≥ silence_hangover_frames consecutive hops
-                     OR segment length ≥ max_segment_samples)
-                  → emit segment + classify, → IDLE (cooldown)
-
-    Use this for classifier_mode (mode 3). For prototype-based modes (1/2),
-    SlidingKWS remains the right choice — those models were trained on fixed-
-    length features and don't have variable-length support.
+    Use this for classifier_mode (mode 3). For prototype-based modes
+    (1/2), SlidingKWS remains the right choice.
     """
 
     def __init__(self, model, labels, *, threshold=0.6, hop_ms=20,
-                 start_thr=0.01, stop_thr=0.005,
-                 speech_onset_ms=60, silence_hangover_ms=300,
+                 vad_threshold=0.5, silence_hangover_ms=300,
                  min_speech_ms=200, max_segment_ms=3100,
                  pre_onset_ms=100, cooldown_ms=1000, device, debug=False):
         self.model = model
@@ -187,21 +177,37 @@ class SegmentKWS:
         self.device = device
         self.debug = debug
         self.hop_samples = int(SR * hop_ms / 1000)
-        self.start_thr = start_thr
-        self.stop_thr = stop_thr
-        self.speech_onset_frames = max(1, int(speech_onset_ms / hop_ms))
+        self.vad_threshold = vad_threshold
+        self.silence_hangover_ms = silence_hangover_ms
         self.silence_hangover_frames = max(1, int(silence_hangover_ms / hop_ms))
         self.cooldown_frames = max(0, int(cooldown_ms / hop_ms))
         self.min_speech_samples = int(SR * min_speech_ms / 1000)
         self.max_segment_samples = int(SR * max_segment_ms / 1000)
         self.pre_onset_samples = int(SR * pre_onset_ms / 1000)
 
+        try:
+            from silero_vad import VADIterator, load_silero_vad
+        except ImportError as exc:
+            raise ImportError(
+                "SegmentKWS requires the 'silero-vad' package. "
+                "Install it with: pip install silero-vad"
+            ) from exc
+
+        self._vad_model = load_silero_vad()
+        self._vad_iter = VADIterator(
+            self._vad_model,
+            threshold=self.vad_threshold,
+            sampling_rate=SR,
+            min_silence_duration_ms=silence_hangover_ms,
+            speech_pad_ms=pre_onset_ms,
+        )
+        self._vad_window_samples = 512
+
         # rolling pre-onset buffer (always-on, captures leading consonants)
         self._pre_buf = collections.deque(maxlen=self.pre_onset_samples)
+        self._vad_buf = []
         self._buf = []           # active segment audio
         self._state = 'IDLE'
-        self._consec_speech = 0
-        self._consec_silence = 0
         self._cooldown = 0
         self._frame = 0
         self._audio_offset = 0
@@ -218,52 +224,50 @@ class SegmentKWS:
         Returns (label, score) on trigger else (None, None)."""
         chunk_list = chunk.tolist() if torch.is_tensor(chunk) else list(chunk)
         self._frame += 1
-        # cheap RMS — float() forces python scalar so we don't accumulate graph state
-        ch_t = chunk if torch.is_tensor(chunk) else torch.tensor(chunk)
-        rms = float((ch_t.to(torch.float32) ** 2).mean().sqrt())
-
-        # always feed the pre-onset rolling buffer
         self._pre_buf.extend(chunk_list)
+        self._vad_buf.extend(chunk_list)
+        if self._state == 'IN_SPEECH':
+            self._buf.extend(chunk_list)
+            if len(self._buf) >= self.max_segment_samples:
+                return self._classify_current_segment(ended_by_maxlen=True)
+
+        event = None
+        while len(self._vad_buf) >= self._vad_window_samples:
+            vad_chunk = torch.tensor(
+                self._vad_buf[:self._vad_window_samples],
+                dtype=torch.float32,
+            )
+            del self._vad_buf[:self._vad_window_samples]
+            event = self._vad_iter(vad_chunk)
+            if event is None:
+                continue
+            if 'start' in event and self._state == 'IDLE':
+                self._state = 'IN_SPEECH'
+                self._buf = list(self._pre_buf)
+                self._seg_start_frame = self._frame
+                if self.debug:
+                    print(f'  [speech onset sample={event["start"]}]')
+            elif 'end' in event and self._state == 'IN_SPEECH':
+                break
+
+        if event is not None and 'end' in event and self._state == 'IN_SPEECH':
+            if self._cooldown > 0:
+                self._cooldown -= 1
+                self._reset()
+                return None, None
+            return self._classify_current_segment(ended_by_maxlen=False)
 
         if self._cooldown > 0:
             self._cooldown -= 1
-            return None, None
+        return None, None
 
-        if self._state == 'IDLE':
-            if rms > self.start_thr:
-                self._consec_speech += 1
-                if self._consec_speech >= self.speech_onset_frames:
-                    self._state = 'IN_SPEECH'
-                    self._buf = list(self._pre_buf)  # backfill leading audio
-                    self._consec_silence = 0
-                    self._seg_start_frame = self._frame
-                    if self.debug:
-                        t = self._audio_offset + self._frame * self.hop_samples / SR
-                        print(f'  [speech onset t={t:.2f}s  rms={rms:.4f}]')
-            else:
-                self._consec_speech = 0
-            return None, None
-
-        # IN_SPEECH
-        self._buf.extend(chunk_list)
-        if rms < self.stop_thr:
-            self._consec_silence += 1
-        else:
-            self._consec_silence = 0
-
-        ended_by_silence = self._consec_silence >= self.silence_hangover_frames
-        ended_by_maxlen = len(self._buf) >= self.max_segment_samples
-        if not (ended_by_silence or ended_by_maxlen):
-            return None, None
-
-        # ---- segment ended → classify
+    def _classify_current_segment(self, ended_by_maxlen=False):
         seg_len = min(len(self._buf), self.max_segment_samples)
-        # account for the trailing silence-hangover not being part of "real" speech
-        if ended_by_silence:
-            tail_silence_samples = self.silence_hangover_frames * self.hop_samples
-            speech_len = max(self.min_speech_samples, seg_len - tail_silence_samples)
-        else:
+        if ended_by_maxlen:
             speech_len = seg_len
+        else:
+            tail_silence_samples = int(SR * self.silence_hangover_ms / 1000)
+            speech_len = max(self.min_speech_samples, seg_len - tail_silence_samples)
 
         t_end = self._audio_offset + self._frame * self.hop_samples / SR
         t_start = t_end - seg_len / SR
@@ -271,7 +275,7 @@ class SegmentKWS:
         if speech_len < self.min_speech_samples:
             if self.debug:
                 print(f'  [segment too short t={t_start:.2f}-{t_end:.2f}s '
-                      f'len={speech_len/SR:.2f}s — discarded]')
+                      f'len={speech_len/SR:.2f}s discarded]')
             self._reset()
             return None, None
 
@@ -311,8 +315,6 @@ class SegmentKWS:
     def _reset(self):
         self._buf = []
         self._state = 'IDLE'
-        self._consec_speech = 0
-        self._consec_silence = 0
         self._seg_start_frame = None
 
 
@@ -328,7 +330,7 @@ class SlidingKWS:
                  ema_alpha=1.0, classifier_mode=False, device, debug=False):
         self.model = model
         self.prototypes = prototypes    # (N, D) L2-normalised, on device (None in mode 3)
-        self.beta = beta                # reprojection parameter; None → raw cosine
+        self.beta = beta                # reprojection parameter; None 鈫?raw cosine
         self.labels = labels
         self.threshold = threshold
         self.device = device
@@ -340,7 +342,7 @@ class SlidingKWS:
         self.trigger_frames = trigger_frames
         self.cooldown_frames = int(cooldown_ms / hop_ms)  # frames to suppress after trigger
         self.ema_alpha = ema_alpha       # 1.0 = no smoothing; 0.3 = strong smoothing
-        self.classifier_mode = classifier_mode  # True → model returns logits directly
+        self.classifier_mode = classifier_mode  # True 鈫?model returns logits directly
         self._consec = 0
         self._streak_label = None   # which class is currently building a streak
         self._cooldown = 0   # remaining suppression frames
@@ -377,7 +379,7 @@ class SlidingKWS:
                            device=self.device).unsqueeze(0).unsqueeze(0)
 
         if self.classifier_mode:
-            # Mode 3: model is a KWSClassifier → forward returns logits (1, N).
+            # Mode 3: model is a KWSClassifier 鈫?forward returns logits (1, N).
             # Pass the actual sample length so encoders trained in pad mode get
             # the right mask-aware GAP; on a fixed 1s window this collapses to
             # the legacy global GAP anyway.
@@ -385,7 +387,7 @@ class SlidingKWS:
             logits = self.model(wav, lengths=L).squeeze(0)
             raw = logits
         else:
-            # Mode 1/2: prototype-based — embed + similarity
+            # Mode 1/2: prototype-based 鈥?embed + similarity
             emb = F.normalize(self.model.get_embeddings(wav), dim=-1)  # (1, D)
             if self.beta is not None:
                 raw = reproj_scores(emb, self.prototypes, self.beta, self.device)
@@ -430,7 +432,7 @@ class SlidingKWS:
             if best_label == self._streak_label:
                 self._consec += 1
             else:
-                # class switched mid-streak → restart count for the new class
+                # class switched mid-streak 鈫?restart count for the new class
                 self._streak_label = best_label
                 self._consec = 1
             if self._consec >= self.trigger_frames:
@@ -504,31 +506,28 @@ def main():
     parser.add_argument('--cpu', action='store_true',
                         help='Force CPU even if CUDA is available')
 
-    # detector choice — classifier mode defaults to segment (matches training)
+    # detector choice 鈥?classifier mode defaults to segment (matches training)
     parser.add_argument('--detector', choices=['auto', 'segment', 'sliding'],
                         default='auto',
-                        help="'auto' (default) → segment in classifier_mode, "
+                        help="'auto' (default) 鈫?segment in classifier_mode, "
                              "sliding for prototype modes. Use 'sliding' to "
                              "force the legacy fixed-window detector.")
-    # SegmentKWS energy-VAD knobs
-    parser.add_argument('--start_thr', type=float, default=0.01,
-                        help='RMS threshold to enter IN_SPEECH (default 0.01)')
-    parser.add_argument('--stop_thr', type=float, default=0.005,
-                        help='RMS threshold below which silence accumulates '
-                             '(hysteresis below start_thr; default 0.005)')
-    parser.add_argument('--speech_onset_ms', type=int, default=60,
-                        help='Sustained hop count crossing start_thr to confirm '
-                             'speech onset (default 60ms = 3 hops at 20ms)')
+    # SegmentKWS Silero VAD knobs
+    parser.add_argument('--vad_threshold', type=float, default=0.5,
+                        help='Silero VAD speech probability threshold '
+                             '(default: 0.5; higher is stricter)')
     parser.add_argument('--silence_hangover_ms', type=int, default=200,
-                        help='Trailing silence to declare segment end (default 300ms)')
+                        help='Trailing non-speech duration required before '
+                             'closing a segment, in ms (default: 200)')
     parser.add_argument('--min_speech_ms', type=int, default=200,
-                        help='Discard segments shorter than this (default 200ms)')
+                        help='Discard detected speech segments shorter than '
+                             'this many ms (default: 200)')
     parser.add_argument('--max_segment_ms', type=int, default=3100,
-                        help='Cap segment length; matches training upper bound '
-                             '(default 3100ms = CompanyKWS P99)')
+                        help='Force-close and classify a segment after this '
+                             'many ms (default: 3100)')
     parser.add_argument('--pre_onset_ms', type=int, default=100,
-                        help='Backfill audio kept before onset; recovers leading '
-                             'consonants the energy gate missed (default 100ms)')
+                        help='Audio padding/backfill kept before Silero speech '
+                             'onset, in ms (default: 100)')
 
     args = parser.parse_args()
 
@@ -560,7 +559,7 @@ def main():
         model, prototypes, beta, labels, _ = load_pretrained(
             args.model, args.support, args.seconds, device)
 
-    # Threshold default: mode 3 → thr_far05 from ckpt; others → 0.85 (legacy)
+    # Threshold default: mode 3 鈫?thr_far05 from ckpt; others 鈫?0.85 (legacy)
     if args.threshold is None:
         threshold = suggested_thr if suggested_thr is not None else 0.85
         print(f'Using threshold = {threshold:.4f}')
@@ -578,9 +577,7 @@ def main():
             model, labels,
             threshold=threshold,
             hop_ms=args.hop_ms,
-            start_thr=args.start_thr,
-            stop_thr=args.stop_thr,
-            speech_onset_ms=args.speech_onset_ms,
+            vad_threshold=args.vad_threshold,
             silence_hangover_ms=args.silence_hangover_ms,
             min_speech_ms=args.min_speech_ms,
             max_segment_ms=args.max_segment_ms,
@@ -616,7 +613,7 @@ def main():
     if detector_kind == 'segment':
         print(f"\nStreaming '{wav_path.name}' ({total_s:.2f}s) | "
               f"detector=segment | hop={args.hop_ms}ms | threshold={threshold:.4f} | "
-              f"start_thr={args.start_thr} | stop_thr={args.stop_thr} | "
+              f"vad_threshold={args.vad_threshold} | "
               f"silence_hangover={args.silence_hangover_ms}ms | "
               f"cooldown_ms={args.cooldown_ms}\n")
     else:

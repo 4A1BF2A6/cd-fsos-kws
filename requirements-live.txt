@@ -7,3 +7,4 @@ torch==1.13.1
 torchaudio==0.13.1
 matplotlib==3.5.3
 sounddevice==0.4.6
+silero-vad==6.2.1
