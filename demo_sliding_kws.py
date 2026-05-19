@@ -206,8 +206,10 @@ class SegmentKWS:
         self._cooldown = 0
         self._frame = 0
         self._audio_offset = 0
-        self._unk_idx = (self.labels.index('_unknown_')
-                         if '_unknown_' in self.labels else None)
+        # Both _unknown_ and _silence_ are rejection classes from the deployment's
+        # point of view — mask both out before picking the best wake.
+        self._reject_idxs = [self.labels.index(l) for l in ('_unknown_', '_silence_')
+                             if l in self.labels]
         # exposed for UI compat with SlidingKWS
         self._smooth_probs = None
         # tracks current speech segment start time for debug output
@@ -283,12 +285,13 @@ class SegmentKWS:
         probs = torch.softmax(logits, dim=0)
         self._smooth_probs = probs.detach()
 
-        unk_i = self._unk_idx
-        if unk_i is not None:
+        reject_idxs = self._reject_idxs
+        if reject_idxs:
             mask = torch.ones(len(self.labels), dtype=torch.bool, device=self.device)
-            mask[unk_i] = False
+            for j in reject_idxs:
+                mask[j] = False
             wake_probs = probs[mask]
-            wake_labels = [l for j, l in enumerate(self.labels) if j != unk_i]
+            wake_labels = [l for j, l in enumerate(self.labels) if j not in reject_idxs]
         else:
             wake_probs = probs
             wake_labels = list(self.labels)
@@ -348,8 +351,11 @@ class SlidingKWS:
         self.debug = debug
         self._frame = 0
         self._audio_offset = 0   # set by main loop to align debug time with audio
-        self._unk_idx = (list(labels).index('_unknown_')
-                         if '_unknown_' in list(labels) else None)
+        # Both _unknown_ and _silence_ are rejection classes from the deployment's
+        # point of view — mask both out before picking the best wake.
+        _labels_list = list(labels)
+        self._reject_idxs = [_labels_list.index(l) for l in ('_unknown_', '_silence_')
+                             if l in _labels_list]
 
     @torch.no_grad()
     def push(self, chunk: torch.Tensor):
@@ -388,12 +394,13 @@ class SlidingKWS:
             self._smooth_probs = self.ema_alpha * probs + (1 - self.ema_alpha) * self._smooth_probs
         sprobs = self._smooth_probs
 
-        unk_i = self._unk_idx
-        if unk_i is not None:
+        reject_idxs = self._reject_idxs
+        if reject_idxs:
             mask = torch.ones(len(self.labels), dtype=torch.bool, device=self.device)
-            mask[unk_i] = False
+            for j in reject_idxs:
+                mask[j] = False
             wake_probs  = sprobs[mask]
-            wake_labels = [l for j, l in enumerate(self.labels) if j != unk_i]
+            wake_labels = [l for j, l in enumerate(self.labels) if j not in reject_idxs]
         else:
             wake_probs  = sprobs
             wake_labels = list(self.labels)

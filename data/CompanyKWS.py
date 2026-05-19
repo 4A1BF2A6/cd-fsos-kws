@@ -175,7 +175,7 @@ class CompanyKWSDataset:
 
         # split percentages
         params = {
-            'silence_percentage': 10.0,
+            'silence_percentage': float(args.get('silence_percentage', 10.0)),
             'unknown_percentage': 0.0,    # unknown disabled by default for this dataset
             'validation_percentage': 10.0,
             'testing_percentage': 10.0,
