@@ -130,7 +130,9 @@ def load_pretrained(model_path, support_dir, seconds, device):
 def load_classifier(ckpt_path, device):
     """Load a fixed N+1 way KWS classifier (mode 3)."""
     from train_kws_classifier import KWSClassifier
-    ckpt = torch.load(ckpt_path, map_location=device)
+    # weights_only=False：本地受信 ckpt 含 numpy scalar / dict 等非张量字段；
+    # torch 2.6+ 默认 weights_only=True 会拦下来。torch 1.13 也支持此 kwarg。
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     model = KWSClassifier(ckpt['encoder_ckpt'], ckpt['n_classes'],
                           freeze_encoder=ckpt['freeze_encoder'],
                           head=ckpt.get('head', 'linear'),
@@ -170,38 +172,47 @@ class SegmentKWS:
     def __init__(self, model, labels, *, threshold=0.6, hop_ms=20,
                  vad_threshold=0.5, silence_hangover_ms=300,
                  min_speech_ms=200, max_segment_ms=3100,
-                 pre_onset_ms=100, cooldown_ms=1000, device, debug=False):
+                 pre_onset_ms=100, cooldown_ms=1000, device,
+                 external_vad=False, speech_onset_ms=60, debug=False):
         self.model = model
         self.labels = list(labels)
         self.threshold = threshold
         self.device = device
         self.debug = debug
+        self.external_vad = bool(external_vad)
         self.hop_samples = int(SR * hop_ms / 1000)
         self.vad_threshold = vad_threshold
         self.silence_hangover_ms = silence_hangover_ms
         self.silence_hangover_frames = max(1, int(silence_hangover_ms / hop_ms))
+        self.speech_onset_frames = max(1, int(speech_onset_ms / hop_ms))
         self.cooldown_frames = max(0, int(cooldown_ms / hop_ms))
         self.min_speech_samples = int(SR * min_speech_ms / 1000)
         self.max_segment_samples = int(SR * max_segment_ms / 1000)
         self.pre_onset_samples = int(SR * pre_onset_ms / 1000)
 
-        try:
-            from silero_vad import VADIterator, load_silero_vad
-        except ImportError as exc:
-            raise ImportError(
-                "SegmentKWS requires the 'silero-vad' package. "
-                "Install it with: pip install silero-vad"
-            ) from exc
+        if not self.external_vad:
+            try:
+                from silero_vad import VADIterator, load_silero_vad
+            except ImportError as exc:
+                raise ImportError(
+                    "SegmentKWS requires the 'silero-vad' package. "
+                    "Install it with: pip install silero-vad"
+                ) from exc
 
-        self._vad_model = load_silero_vad()
-        self._vad_iter = VADIterator(
-            self._vad_model,
-            threshold=self.vad_threshold,
-            sampling_rate=SR,
-            min_silence_duration_ms=silence_hangover_ms,
-            speech_pad_ms=pre_onset_ms,
-        )
-        self._vad_window_samples = 512
+            self._vad_model = load_silero_vad()
+            self._vad_iter = VADIterator(
+                self._vad_model,
+                threshold=self.vad_threshold,
+                sampling_rate=SR,
+                min_silence_duration_ms=silence_hangover_ms,
+                speech_pad_ms=pre_onset_ms,
+            )
+            self._vad_window_samples = 512
+        else:
+            # external_vad=True：由调用方传入 is_speech flag，不加载 Silero VAD
+            self._vad_model = None
+            self._vad_iter = None
+            self._vad_window_samples = None
 
         # rolling pre-onset buffer (always-on, captures leading consonants)
         self._pre_buf = collections.deque(maxlen=self.pre_onset_samples)
@@ -211,6 +222,9 @@ class SegmentKWS:
         self._cooldown = 0
         self._frame = 0
         self._audio_offset = 0
+        # counter-based state machine used when external_vad=True
+        self._consec_speech  = 0
+        self._consec_silence = 0
         # Both _unknown_ and _silence_ are rejection classes from the deployment's
         # point of view — mask both out before picking the best wake.
         self._reject_idxs = [self.labels.index(l) for l in ('_unknown_', '_silence_')
@@ -221,12 +235,53 @@ class SegmentKWS:
         self._seg_start_frame = None
 
     @torch.no_grad()
-    def push(self, chunk: torch.Tensor):
+    def push(self, chunk, voice_active=None):
         """chunk: (T,) float32 PCM, typically one hop worth.
+        voice_active: 0/1 flag from an upstream VAD; required when
+                      external_vad=True, ignored otherwise.
         Returns (label, score) on trigger else (None, None)."""
-        chunk_list = chunk.tolist() if torch.is_tensor(chunk) else list(chunk)
+        chunk_list = chunk.tolist() if torch.is_tensor(chunk) else (
+            chunk.tolist() if hasattr(chunk, 'tolist') else list(chunk))
         self._frame += 1
         self._pre_buf.extend(chunk_list)
+
+        if self.external_vad:
+            # ── External VAD path: counter-based state machine ──────
+            flag = int(bool(voice_active))
+            if self._cooldown > 0:
+                self._cooldown -= 1
+                return None, None
+
+            if self._state == 'IDLE':
+                if flag:
+                    self._consec_speech += 1
+                    if self._consec_speech >= self.speech_onset_frames:
+                        self._state = 'IN_SPEECH'
+                        self._buf = list(self._pre_buf)
+                        self._seg_start_frame = self._frame
+                        self._consec_speech = 0
+                        self._consec_silence = 0
+                        if self.debug:
+                            t = self._frame * self.hop_samples / SR
+                            print(f'  [speech onset t={t:.2f}s  vad=1]')
+                else:
+                    self._consec_speech = 0
+                return None, None
+
+            # IN_SPEECH
+            self._buf.extend(chunk_list)
+            if len(self._buf) >= self.max_segment_samples:
+                return self._classify_current_segment(ended_by_maxlen=True)
+
+            if not flag:
+                self._consec_silence += 1
+                if self._consec_silence >= self.silence_hangover_frames:
+                    return self._classify_current_segment(ended_by_maxlen=False)
+            else:
+                self._consec_silence = 0
+            return None, None
+
+        # ── Silero VAD path (original) ───────────────────────────────
         self._vad_buf.extend(chunk_list)
         if self._state == 'IN_SPEECH':
             self._buf.extend(chunk_list)
@@ -319,6 +374,8 @@ class SegmentKWS:
         self._buf = []
         self._state = 'IDLE'
         self._seg_start_frame = None
+        self._consec_speech  = 0
+        self._consec_silence = 0
 
 
 class SlidingKWS:

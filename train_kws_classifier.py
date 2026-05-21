@@ -42,7 +42,9 @@ class KWSClassifier(nn.Module):
     def __init__(self, encoder_ckpt, n_classes, freeze_encoder=True,
                  head='linear', head_hidden=128, head_dropout=0.2):
         super().__init__()
-        repr_model = torch.load(encoder_ckpt, map_location='cpu')
+        # weights_only=False：encoder ckpt 是整 ReprModel 对象（非 state_dict）；
+        # torch 2.6+ 默认 weights_only=True 会拦下来。torch 1.13 也支持此 kwarg。
+        repr_model = torch.load(encoder_ckpt, map_location='cpu', weights_only=False)
         self.preprocessing = repr_model.preprocessing
         # legacy checkpoints may lack newer attrs added to MFCC
         if hasattr(self.preprocessing, 'mfcc') and not hasattr(self.preprocessing, 'force_cpu'):
